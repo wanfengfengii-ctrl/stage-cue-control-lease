@@ -37,6 +37,8 @@ export class MockServer {
   serverNow = 1_700_000_000_000;
   ttl = 30_000;
   events: Record<string, number> = {};
+  /** action_id -> link id of the most recent linked execution. */
+  links: Record<string, string> = {};
 
   /** Move the server clock past every outstanding lease. */
   elapse30s() {
@@ -69,6 +71,7 @@ export class MockServer {
       last_executed_by:
         this.leases[id]?.executed ? this.leases[id].holder : null,
       event_count: this.events[id] ?? 0,
+      last_link_id: this.links[id] ?? null,
       server_time: new Date(this.serverNow).toISOString(),
     };
   }
@@ -89,6 +92,87 @@ export class MockServer {
     };
   }
 
+  private statesFor(ids: string[]) {
+    return Object.fromEntries(
+      ids.filter((id) => ACTION_IDS.includes(id)).map((id) => [id, this.state(id)]),
+    );
+  }
+
+  /** Mirrors POST /api/actions/execute-linked: all commit or none does. */
+  private handleLinked(payload: any) {
+    const items: { action_id: string; token?: string }[] = payload.items ?? [];
+    if (items.length < 2) {
+      return {
+        status: 400,
+        body: { detail: { code: "invalid_request", message: "联动执行至少需要两个动作" } },
+      };
+    }
+    const ids = items.map((it) => it.action_id);
+    if (new Set(ids).size !== ids.length) {
+      return {
+        status: 400,
+        body: { detail: { code: "invalid_request", message: "联动动作不得重复" } },
+      };
+    }
+    for (const id of ids) {
+      if (!ACTION_IDS.includes(id)) {
+        return {
+          status: 404,
+          body: { detail: { code: "unknown_action", message: "未知动作", action_id: id } },
+        };
+      }
+    }
+    // Validate EVERY token first; any failure aborts the whole run.
+    for (const it of items) {
+      if (!it.token) {
+        return {
+          status: 401,
+          body: {
+            detail: {
+              code: "missing_token",
+              message: "缺少令牌：联动执行要求每个动作都携带有效令牌",
+              action_id: it.action_id,
+              states: this.statesFor(ids),
+            },
+          },
+        };
+      }
+      const live = this.live(it.action_id);
+      if (!live || live.token !== it.token) {
+        return {
+          status: 409,
+          body: {
+            detail: {
+              code: "control_lost",
+              message: live
+                ? "控制权已失效：该令牌已被新租约取代"
+                : "控制权已失效：租约已到期、释放或执行",
+              action_id: it.action_id,
+              states: this.statesFor(ids),
+            },
+          },
+        };
+      }
+    }
+    const linkId = `link-${Math.random().toString(36).slice(2)}`;
+    const events = items.map((it) => {
+      const live = this.live(it.action_id)!;
+      live.executed = true;
+      this.events[it.action_id] = (this.events[it.action_id] ?? 0) + 1;
+      this.links[it.action_id] = linkId;
+      return {
+        action_id: it.action_id,
+        event_id: this.events[it.action_id],
+        executed_by: live.holder,
+        occurred_at: new Date(this.serverNow).toISOString(),
+      };
+    });
+    return {
+      status: 200,
+      body: { linked: true, link_id: linkId, events, states: this.statesFor(ids) },
+    };
+  }
+
   /** Entry point used by the mocked global fetch. */
   handle(url: string, init?: { method?: string; body?: string }) {
     const method = init?.method ?? "GET";
@@ -96,6 +180,12 @@ export class MockServer {
 
     if (url.endsWith("/api/actions") && method === "GET") {
       return { status: 200, body: this.all() };
+    }
+
+    // Linked execution must be matched before the single-action regex,
+    // which would otherwise read "execute-linked" as an action id.
+    if (url.endsWith("/api/actions/execute-linked") && method === "POST") {
+      return this.handleLinked(payload);
     }
 
     const m = url.match(/\/api\/actions\/([^/]+)(?:\/(lease|renew|release|execute))?$/);

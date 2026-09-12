@@ -1,10 +1,13 @@
-"""Lease lifecycle: acquire / renew / release / execute.
+"""Lease lifecycle: acquire / renew / release / execute / linked execute.
 
 Every operation runs in ONE database transaction:
 
   1. LOCK the action row with SELECT ... FOR UPDATE.  Concurrent operations on
      the same action are therefore serialised by PostgreSQL itself — two seats
-     racing for one action can never both observe "free".
+     racing for one action can never both observe "free".  Linked execution
+     locks its action rows in sorted action-id order, so a linked run and a
+     single-action execute (or two linked runs) never deadlock and exactly
+     one side commits.
   2. Read the most recent lease row.
   3. Decide validity against the transaction's server-side now() clock.
   4. Mutate and commit, or roll back.
@@ -32,6 +35,11 @@ def hash_token(token: str) -> str:
 
 def _new_token() -> str:
     return secrets.token_urlsafe(TOKEN_BYTES)
+
+
+def _new_link_id() -> str:
+    """Server-generated identifier shared by the events of one linked run."""
+    return secrets.token_urlsafe(16)
 
 
 def _lock_action(conn: psycopg.Connection, action_id: str):
@@ -66,11 +74,20 @@ def _is_live(lease: dict[str, Any] | None, now) -> bool:
 class LeaseError(Exception):
     """Logical rejection (not a database error)."""
 
-    def __init__(self, code: str, message: str, status: int = 409):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status: int = 409,
+        action_id: str | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        # For linked execution: which action's token failed, so the caller
+        # (and the UI) can point at the exact card that must re-acquire.
+        self.action_id = action_id
 
 
 def acquire(action_id: str, holder: str) -> dict[str, Any]:
@@ -128,7 +145,7 @@ def acquire(action_id: str, holder: str) -> dict[str, Any]:
 def _authenticate_live(conn, action_id: str, token: str, now):
     """Lock action and return the latest lease iff it is live AND token matches."""
     if _lock_action(conn, action_id) is None:
-        raise LeaseError("unknown_action", "未知动作", 404)
+        raise LeaseError("unknown_action", "未知动作", 404, action_id=action_id)
     latest = _latest_lease(conn, action_id)
     if latest is None or not _is_live(latest, now):
         # Expired / released / executed: a new seat may already hold a fresh
@@ -137,6 +154,7 @@ def _authenticate_live(conn, action_id: str, token: str, now):
             "control_lost",
             "控制权已失效：租约已到期、释放或执行",
             409,
+            action_id=action_id,
         )
     if not secrets.compare_digest(latest["token_hash"], hash_token(token)):
         # A live lease exists but belongs to another (newer) token.
@@ -144,6 +162,7 @@ def _authenticate_live(conn, action_id: str, token: str, now):
             "control_lost",
             "控制权已失效：该令牌已被新租约取代",
             409,
+            action_id=action_id,
         )
     return latest
 
@@ -225,11 +244,109 @@ def execute(action_id: str, token: str) -> dict[str, Any]:
     }
 
 
+def execute_linked(items: list[dict[str, str]]) -> dict[str, Any]:
+    """Execute several held actions as ONE atomic linked operation.
+
+    Either every action commits (lease terminated + one event each, all
+    sharing a server-generated link id) or — if any token is missing,
+    expired, or superseded — the transaction rolls back: no event is
+    written and no other lease is touched.
+
+    Action rows are locked in sorted action-id order regardless of the
+    request's item order, so concurrent linked executions (or a linked
+    execution racing a single-action execute) serialise on the same row
+    locks without deadlocking.
+    """
+    parsed = [
+        {"action_id": (it.get("action_id") or "").strip(),
+         "token": it.get("token") or ""}
+        for it in items
+    ]
+    if len(parsed) < 2:
+        raise LeaseError(
+            "invalid_request", "联动执行至少需要两个动作", 400
+        )
+    action_ids = [it["action_id"] for it in parsed]
+    if len(set(action_ids)) != len(action_ids):
+        raise LeaseError(
+            "invalid_request", "联动动作不得重复", 400
+        )
+    tokens = {it["action_id"]: it["token"] for it in parsed}
+    for aid in action_ids:
+        if aid not in config.ACTION_IDS:
+            raise LeaseError("unknown_action", "未知动作", 404, action_id=aid)
+    for it in parsed:
+        if not it["token"]:
+            raise LeaseError(
+                "missing_token",
+                "缺少令牌：联动执行要求每个动作都携带有效令牌",
+                401,
+                action_id=it["action_id"],
+            )
+
+    # Fixed lock order: sorted by action id, independent of request order.
+    ordered = sorted(action_ids)
+    link_id = _new_link_id()
+    pool = db.get_pool()
+    with pool.connection() as conn:
+        try:
+            with conn.transaction():
+                now = db.server_now(conn)
+                held = {}
+                for aid in ordered:
+                    # Locks the action row (FOR UPDATE) and validates the
+                    # token against the live lease. The first failure raises
+                    # and rolls back the whole transaction.
+                    held[aid] = _authenticate_live(conn, aid, tokens[aid], now)
+                events = []
+                for aid in ordered:
+                    lease = held[aid]
+                    conn.execute(
+                        "UPDATE leases SET executed_at = %s WHERE id = %s",
+                        (now, lease["id"]),
+                    )
+                    event = conn.execute(
+                        """
+                        INSERT INTO action_events
+                            (action_id, lease_id, token_hash, holder, result,
+                             link_id)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        RETURNING id, occurred_at
+                        """,
+                        (
+                            aid,
+                            lease["id"],
+                            lease["token_hash"],
+                            lease["holder"],
+                            "executed",
+                            link_id,
+                        ),
+                    ).fetchone()
+                    events.append(
+                        {
+                            "action_id": aid,
+                            "event_id": event["id"],
+                            "executed_by": lease["holder"],
+                            "occurred_at": event["occurred_at"].isoformat(),
+                        }
+                    )
+                states = {aid: db.state_for(conn, aid, now) for aid in ordered}
+        except psycopg.errors.UniqueViolation:
+            # Defensive: an event already exists for one of these leases.
+            raise LeaseError(
+                "already_executed", "该租约已执行过，动作事件不得重复写入", 409
+            )
+    return {
+        "linked": True,
+        "link_id": link_id,
+        "events": events,
+        "states": states,
+    }
+
+
 def get_action_state(action_id: str) -> dict[str, Any]:
     with db.get_pool().connection() as conn:
         return db.fetch_action_state(conn, action_id)
-
-
 def list_states() -> list[dict[str, Any]]:
     with db.get_pool().connection() as conn:
         return db.fetch_all_states(conn)

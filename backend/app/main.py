@@ -29,6 +29,19 @@ class TokenBody(BaseModel):
     token: str = Field(..., description="授予时返回的不可猜测令牌")
 
 
+class LinkedItem(BaseModel):
+    action_id: str = Field(..., description="参与联动的动作编号")
+    # Defaults to "" so a missing token is judged uniformly by the service
+    # (401 naming the action) instead of a schema-level 422.
+    token: str = Field(default="", description="该动作的当前有效令牌")
+
+
+class LinkedExecuteBody(BaseModel):
+    items: list[LinkedItem] = Field(
+        ..., description="联动的动作与令牌；全部成功或全部不变"
+    )
+
+
 @app.on_event("startup")
 def _startup() -> None:
     db.init_db()
@@ -120,6 +133,32 @@ def execute_action(action_id: str, body: TokenBody,
             "code": exc.code, "message": exc.message,
             "state": leases.get_action_state(action_id)
             if action_id in config.ACTION_IDS else None,
+        })
+
+
+@app.post("/api/actions/execute-linked")
+def execute_linked_actions(body: LinkedExecuteBody):
+    """Atomic linked execution: every listed action commits, or none does.
+
+    On failure the response names the concrete action whose token is
+    missing/expired/superseded and carries fresh snapshots of all involved
+    actions so the console can re-render real control state.
+    """
+    try:
+        return leases.execute_linked(
+            [{"action_id": it.action_id, "token": it.token} for it in body.items]
+        )
+    except leases.LeaseError as exc:
+        involved = list(dict.fromkeys(it.action_id for it in body.items))
+        raise HTTPException(status_code=exc.status, detail={
+            "code": exc.code,
+            "message": exc.message,
+            "action_id": exc.action_id,
+            "states": {
+                aid: leases.get_action_state(aid)
+                for aid in involved
+                if aid in config.ACTION_IDS
+            },
         })
 
 

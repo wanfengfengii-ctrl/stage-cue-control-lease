@@ -23,6 +23,7 @@ export default function App() {
   const [tokens, setTokens] = useState<Record<string, string>>(loadTokens);
   const [notices, setNotices] = useState<Record<string, Notice>>({});
   const [busy, setBusy] = useState<Record<string, boolean>>({});
+  const [linkedBusy, setLinkedBusy] = useState(false);
   const [tick, setTick] = useState(0);
   const fetchStartRef = useRef<number>(Date.now());
   const seatRef = useRef(seat);
@@ -194,6 +195,62 @@ export default function App() {
   const fetchStartMs = fetchStartRef.current;
   void tick; // re-render each second
 
+  // Actions this seat currently controls (valid lease + token in session).
+  const myHeld = actions.filter(
+    (s) => tokens[s.action_id] && s.holder === seat && s.status === "held",
+  );
+  const labelOf = (actionId: string) =>
+    actions.find((a) => a.action_id === actionId)?.label ?? actionId;
+
+  // Linked execution: submit every held action as ONE atomic operation.
+  const onExecuteLinked = async () => {
+    const held = myHeld;
+    if (held.length < 2) return;
+    const items = held.map((s) => ({
+      action_id: s.action_id,
+      token: tokens[s.action_id]!,
+    }));
+    setLinkedBusy(true);
+    try {
+      const out = await api.executeLinked(items);
+      for (const it of items) {
+        setToken(it.action_id, null);
+        const ev = out.events.find((e) => e.action_id === it.action_id);
+        notice(it.action_id, {
+          kind: "success",
+          text: `联动执行成功（联动标识 ${out.link_id.slice(0, 8)}…，事件 #${
+            ev?.event_id ?? "?"
+          }），${items.length} 个动作共享同一标识、各写入一条事件。`,
+        });
+      }
+    } catch (e) {
+      const err = e as ApiError;
+      // Keep every card's real control state: no token is cleared here.
+      // The failed card is told to re-acquire; the others learn that the
+      // whole run was cancelled and their lease is untouched.
+      const failedId = err.action_id;
+      const failedLabel = failedId ? labelOf(failedId) : null;
+      for (const it of items) {
+        if (failedId && it.action_id === failedId) {
+          notice(it.action_id, {
+            kind: "error",
+            text: `联动未执行：${err.message}。请重新取得控制权后再次提交联动。`,
+          });
+        } else {
+          notice(it.action_id, {
+            kind: failedId ? "info" : "error",
+            text: failedId
+              ? `联动未执行：因「${failedLabel}」控制权失效，整次联动已取消，本动作保持原状态（未执行、未终结租约）。`
+              : `联动未执行：${err.message}`,
+          });
+        }
+      }
+    } finally {
+      setLinkedBusy(false);
+      void refresh();
+    }
+  };
+
   const rows = useMemo(
     () =>
       actions.map((state) => (
@@ -240,9 +297,29 @@ export default function App() {
       {!seat.trim() ? (
         <p className="please">请填写本席名称以查看动作状态。</p>
       ) : (
-        <section className="grid" data-testid="actions">
-          {rows}
-        </section>
+        <>
+          {myHeld.length >= 2 && (
+            <section className="linked-bar" data-testid="linked-bar">
+              <span className="linked-info">
+                本席已持有 {myHeld.length} 个动作的控制权（
+                {myHeld.map((s) => s.label).join(" + ")}
+                ），可作为一次联动提交。
+              </span>
+              <button
+                type="button"
+                className="danger"
+                data-testid="btn-execute-linked"
+                disabled={linkedBusy}
+                onClick={onExecuteLinked}
+              >
+                联动执行（一次提交 · 全部成功或全部不变）
+              </button>
+            </section>
+          )}
+          <section className="grid" data-testid="actions">
+            {rows}
+          </section>
+        </>
       )}
 
       <footer>
@@ -322,6 +399,11 @@ function ActionRow(props: RowProps) {
           历史执行：{state.event_count} 次
           {state.last_executed_by ? `（最后：${state.last_executed_by}）` : ""}
         </span>
+        {state.last_link_id && (
+          <span data-testid="last-link" title={state.last_link_id}>
+            最近联动：{state.last_link_id.slice(0, 8)}…
+          </span>
+        )}
       </div>
 
       <div className="buttons">

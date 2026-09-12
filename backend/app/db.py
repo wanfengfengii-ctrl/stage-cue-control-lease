@@ -48,11 +48,17 @@ CREATE TABLE IF NOT EXISTS action_events (
     token_hash  TEXT NOT NULL,
     holder      TEXT NOT NULL,
     result      TEXT NOT NULL,
+    -- NULL for historical single-action executions; linked executions share
+    -- one server-generated link id across their two (or more) events.
+    link_id     TEXT,
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- A successful execution writes exactly one action event per lease.
 CREATE UNIQUE INDEX IF NOT EXISTS action_events_lease_uniq
     ON action_events(lease_id);
+
+-- Migration for databases created before linked execution existed.
+ALTER TABLE action_events ADD COLUMN IF NOT EXISTS link_id TEXT;
 """
 
 
@@ -96,7 +102,11 @@ _STATE_SELECT = """
            l.id AS lease_id, l.token_hash, l.holder, l.acquired_at,
            l.expires_at, l.released_at, l.executed_at,
            (SELECT count(*) FROM action_events e WHERE e.action_id = a.id)
-               AS event_count
+               AS event_count,
+           (SELECT e.link_id FROM action_events e
+             WHERE e.action_id = a.id AND e.link_id IS NOT NULL
+             ORDER BY e.id DESC LIMIT 1)
+               AS last_link_id
       FROM actions a
       LEFT JOIN LATERAL (
           SELECT * FROM leases
@@ -160,5 +170,7 @@ def state_from_row(row: dict[str, Any] | None, now) -> dict[str, Any]:
         if row["executed_at"] is not None
         else None,
         "event_count": row["event_count"],
+        # .get(): rows assembled outside _STATE_SELECT (tests) may lack it.
+        "last_link_id": row.get("last_link_id"),
         "server_time": now.isoformat(),
     }

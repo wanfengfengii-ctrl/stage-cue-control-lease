@@ -11,6 +11,8 @@ export interface ActionState {
   remaining_seconds: number;
   last_executed_by: string | null;
   event_count: number;
+  /** Latest linked-execution id involving this action; null if never linked. */
+  last_link_id: string | null;
   server_time: string;
 }
 
@@ -34,6 +36,10 @@ export interface ApiError extends Error {
   code: string;
   status: number;
   state: ActionState | null;
+  /** Linked execution: which action's token failed (null when n/a). */
+  action_id: string | null;
+  /** Linked execution: fresh snapshots of every involved action. */
+  states: Record<string, ActionState> | null;
 }
 
 function makeError(status: number, body: any): ApiError {
@@ -47,6 +53,8 @@ function makeError(status: number, body: any): ApiError {
   err.code = code;
   err.status = status;
   err.state = detail?.state ?? null;
+  err.action_id = detail?.action_id ?? null;
+  err.states = detail?.states ?? null;
   return err;
 }
 
@@ -94,5 +102,21 @@ export const api = {
     }>(`/api/actions/${actionId}/execute`, {
       method: "POST",
       body: JSON.stringify({ token }),
+    }),
+
+  executeLinked: (items: { action_id: string; token: string }[]) =>
+    request<{
+      linked: boolean;
+      link_id: string;
+      events: {
+        action_id: string;
+        event_id: number;
+        executed_by: string;
+        occurred_at: string;
+      }[];
+      states: Record<string, ActionState>;
+    }>("/api/actions/execute-linked", {
+      method: "POST",
+      body: JSON.stringify({ items }),
     }),
 };

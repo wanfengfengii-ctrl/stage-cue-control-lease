@@ -4,9 +4,14 @@ import App from "../src/App";
 import { MockServer } from "./mock-server";
 
 const ACTION = "lift_up";
+const LINKED_SECOND = "hoist_fly_in";
 
 function card() {
   return screen.getByTestId(`action-${ACTION}`);
+}
+
+function secondCard() {
+  return screen.getByTestId(`action-${LINKED_SECOND}`);
 }
 
 describe("App control-handover interactions", () => {
@@ -158,5 +163,126 @@ describe("App control-handover interactions", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("App linked execution (two actions as one atomic submit)", () => {
+  let server: MockServer;
+
+  beforeEach(() => {
+    server = new MockServer();
+    server.installFetch();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  async function acquireBoth() {
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("本席名称"), {
+      target: { value: "联排控制席" },
+    });
+    await waitFor(() =>
+      expect(within(card()).getByTestId("btn-acquire")).toBeEnabled(),
+    );
+    fireEvent.click(within(card()).getByTestId("btn-acquire"));
+    await waitFor(() =>
+      expect(within(card()).getByTestId("btn-execute")).toBeInTheDocument(),
+    );
+    fireEvent.click(within(secondCard()).getByTestId("btn-acquire"));
+    await waitFor(() =>
+      expect(
+        within(secondCard()).getByTestId("btn-execute"),
+      ).toBeInTheDocument(),
+    );
+  }
+
+  it("shows 联动执行 once both actions are held; success links both cards", async () => {
+    await acquireBoth();
+
+    // The linked bar appears only while this seat holds both actions.
+    const bar = await screen.findByTestId("linked-bar");
+    expect(bar).toHaveTextContent("升降台 上升");
+    expect(bar).toHaveTextContent("飞行吊点 进场");
+
+    fireEvent.click(within(bar).getByTestId("btn-execute-linked"));
+
+    // Both cards report the linked success and each counts exactly one event.
+    await waitFor(() => {
+      expect(within(card()).getByTestId("notice")).toHaveTextContent(
+        /联动执行成功/,
+      );
+      expect(within(secondCard()).getByTestId("notice")).toHaveTextContent(
+        /联动执行成功/,
+      );
+    });
+    await waitFor(() => {
+      expect(within(card()).getByTestId("events")).toHaveTextContent(
+        "历史执行：1 次",
+      );
+      expect(within(secondCard()).getByTestId("events")).toHaveTextContent(
+        "历史执行：1 次",
+      );
+    });
+    expect(server.events[ACTION]).toBe(1);
+    expect(server.events[LINKED_SECOND]).toBe(1);
+
+    // Both cards display the SAME server-generated link id.
+    const linkA = within(card()).getByTestId("last-link").textContent;
+    const linkB = within(secondCard()).getByTestId("last-link").textContent;
+    expect(linkA).toBeTruthy();
+    expect(linkA).toBe(linkB);
+
+    // Both leases are finished: the bar disappears, acquire is offered again.
+    await waitFor(() =>
+      expect(screen.queryByTestId("linked-bar")).toBeNull(),
+    );
+    expect(within(card()).getByTestId("btn-acquire")).toBeEnabled();
+  });
+
+  it("failure names the failed action and keeps both cards' real state", async () => {
+    await acquireBoth();
+    const bar = await screen.findByTestId("linked-bar");
+
+    // The hoist is taken over behind our back; no poll has refreshed yet,
+    // so the linked button is still offered and the click goes out.
+    server.leases[LINKED_SECOND] = {
+      token: "tok-new",
+      holder: "接管席",
+      expiresAt: server.serverNow + 30_000,
+      released: false,
+      executed: false,
+    };
+    fireEvent.click(within(bar).getByTestId("btn-execute-linked"));
+
+    // The failed card is told to re-acquire; the other card learns the
+    // whole run was cancelled and its lease is untouched.
+    await waitFor(() => {
+      expect(within(secondCard()).getByTestId("notice")).toHaveTextContent(
+        /联动未执行.*请重新取得控制权/,
+      );
+    });
+    expect(within(card()).getByTestId("notice")).toHaveTextContent(
+      /整次联动已取消，本动作保持原状态/,
+    );
+
+    // No side effects on the server: zero events, lift lease still live.
+    expect(server.events[ACTION] ?? 0).toBe(0);
+    expect(server.events[LINKED_SECOND] ?? 0).toBe(0);
+    expect(server.leases[ACTION].executed).toBe(false);
+    expect(server.leases[LINKED_SECOND].executed).toBe(false);
+
+    // After the refresh both cards show their REAL control state:
+    // the lift is still mine; the hoist shows the takeover banner.
+    await waitFor(() =>
+      expect(
+        within(secondCard()).getByTestId("lost-banner"),
+      ).toHaveTextContent(/控制权已失效/),
+    );
+    expect(within(card()).getByTestId("btn-execute")).toBeInTheDocument();
+    expect(screen.queryByTestId("linked-bar")).toBeNull();
   });
 });
