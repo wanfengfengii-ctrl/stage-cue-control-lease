@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ANOMALY_CATEGORY_LABELS,
   api,
@@ -30,6 +30,11 @@ export default function HistoryPanel({ onClose }: HistoryPanelProps) {
   const [nextCursor, setNextCursor] = useState<number | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  // Synchronous in-flight guard: state updates only apply on the next
+  // render, so rapid clicks on "加载更早记录" would otherwise each pass the
+  // check and fire duplicate requests for the SAME cursor — appending the
+  // same page of old events twice. A ref is set the moment a request starts.
+  const loadingMoreRef = useRef(false);
   // Failure of the FIRST page: the list is still empty, so the error takes
   // the panel body. Failure of a LATER page: the loaded rows stay and the
   // error + retry move to the list tail.
@@ -55,27 +60,36 @@ export default function HistoryPanel({ onClose }: HistoryPanelProps) {
   }, [loadFirstPage]);
 
   const loadMore = useCallback(async () => {
-    if (nextCursor == null || loadingMore) return;
+    if (nextCursor == null || loadingMoreRef.current) return;
+    loadingMoreRef.current = true;
     setLoadingMore(true);
     setTailError(null);
     try {
       const page = await api.listHistory(nextCursor, HISTORY_PAGE_SIZE);
       // Append only: rows already shown stay exactly where they are; the
-      // keyset cursor guarantees this older page cannot overlap them.
-      setEvents((prev) => [...prev, ...page.events]);
+      // keyset cursor guarantees this older page cannot overlap them. The
+      // dedupe by immutable event id is the second line of defence — even
+      // if a page response ever arrived twice, each historical event still
+      // appears in the list exactly once.
+      setEvents((prev) => {
+        const shown = new Set(prev.map((ev) => ev.event_id));
+        const fresh = page.events.filter((ev) => !shown.has(ev.event_id));
+        return fresh.length === 0 ? prev : [...prev, ...fresh];
+      });
       setNextCursor(page.next_cursor);
     } catch (e) {
       // Keep every loaded row; the retry entry appears at the list tail.
       setTailError((e as ApiError).message);
     } finally {
+      loadingMoreRef.current = false;
       setLoadingMore(false);
     }
-  }, [nextCursor, loadingMore]);
+  }, [nextCursor]);
 
   // Adjacent rows sharing one link id are the two events of a single linked
-  // run — render them as one group. Grouping is computed over the whole
-  // loaded list, so a pair split across a page boundary merges as soon as
-  // the next page arrives.
+  // run — render them as one group. The server never splits a linked run
+  // across a page boundary (the partner is pulled onto the same page), so a
+  // group on screen is always complete, never a broken half.
   const groups = useMemo(() => groupLinkedEvents(events), [events]);
 
   return (

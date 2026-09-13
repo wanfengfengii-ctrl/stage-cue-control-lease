@@ -12,6 +12,11 @@ keyset-paginated by the immutable event id.
     itself (not an offset), events executed WHILE the reviewer is paging
     only ever appear above the first page already shown: they can never
     shift a later page, so no old record is repeated or skipped.
+  * Linked runs are never split: the two events of one linked execution are
+    adjacent in id order, so when the page boundary would fall BETWEEN them the
+    partner is pulled onto this page (the page grows by one) — the reviewer
+    always sees the whole linked group on one screen, and the keyset cursor
+    still guarantees no record is repeated or skipped.
   * One query per page: the session (场次), the link id (联动标识) and the
     anomaly record (异常留痕) are joined in the SAME SELECT — no per-row
     follow-up lookups.
@@ -51,9 +56,17 @@ def parse_cursor(raw: str | None) -> int | None:
     if raw is None:
         return None
     value = raw.strip()
-    # Digits only, in the positive bigint range: anything else (blank,
-    # signed, decimal, overflowing) can never be an event id.
-    if not value.isdigit() or not 0 < int(value) <= _MAX_EVENT_ID:
+    # ASCII digits only, in the positive bigint range: anything else (blank,
+    # signed, decimal, overflowing) can never be an event id.  The ASCII
+    # guard matters because str.isdigit() also accepts Unicode digits —
+    # e.g. superscripts like "¹²³" — which int() then rejects with a
+    # ValueError; those must surface as the same recognisable business
+    # error, never as an unhandled exception.
+    if (
+        not value.isascii()
+        or not value.isdigit()
+        or not 0 < int(value) <= _MAX_EVENT_ID
+    ):
         raise LeaseError(
             "history_cursor_invalid",
             "历史游标无效：请使用上一页响应返回的下一页游标（事件编号）",
@@ -102,6 +115,11 @@ def list_history(
     page).  The page size is clamped to [1, MAX_PAGE_SIZE].  The response's
     `next_cursor` is the id of the page's last event when strictly older
     events exist, else None — the caller stops paging then.
+
+    A linked run's two events are adjacent in id order, so a page boundary
+    can fall between them at most one row deep; when it would, the partner
+    is pulled onto this page (the page grows by one) so the linked group is
+    always complete on one screen.
     """
     cursor = parse_cursor(cursor_raw)
     page_size = clamp_limit(limit)
@@ -110,10 +128,24 @@ def list_history(
             _HISTORY_SELECT
             + " WHERE (%s::bigint IS NULL OR e.id < %s)"
               " ORDER BY e.id DESC LIMIT %s",
-            (cursor, cursor, page_size + 1),  # one extra row: is there more?
+            # Two extra rows: the first detects whether strictly older
+            # events exist; the second covers the page growing by one when
+            # it completes a linked run split by the boundary.
+            (cursor, cursor, page_size + 2),
         ).fetchall()
-    has_more = len(rows) > page_size
     page = rows[:page_size]
+    # Never split a linked run across the page boundary: when the first
+    # event beyond the page shares the page's last link id, it is the
+    # partner of that last event — pull it up so the pair stays adjacent
+    # and complete on this page.
+    if (
+        len(rows) > page_size
+        and page
+        and page[-1]["link_id"] is not None
+        and rows[page_size]["link_id"] == page[-1]["link_id"]
+    ):
+        page = rows[: page_size + 1]
+    has_more = len(rows) > len(page)
     return {
         "events": [_event_from_row(r) for r in page],
         "next_cursor": page[-1]["event_id"] if has_more and page else None,

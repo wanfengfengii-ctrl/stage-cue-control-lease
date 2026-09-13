@@ -230,9 +230,73 @@ def test_page_size_clamped_and_next_cursor_exact(services):
 # ------------------------------------------------------------- invalid cursor
 
 
+def test_linked_run_never_split_across_page_boundary(services):
+    """A linked pair straddling the page boundary is served complete.
+
+    The linked run is created first, then nine singles: in newest-first
+    order the pair's two events sit exactly across the boundary (positions
+    10 and 11). The first page must pull the partner up so the reviewer
+    sees the whole linked group on one screen — never a broken half.
+    """
+    run = _linked(services)
+    for _ in range(9):
+        _execute(services, EXTRA)
+    pair_ids = sorted(ev["event_id"] for ev in run["events"])
+
+    page = history.list_history(None, 10)
+    ids = [e["event_id"] for e in page["events"]]
+    # The page grows by one: 9 singles + BOTH linked events, the pair
+    # complete and adjacent at the page's tail.
+    assert len(ids) == 11
+    assert ids[-2:] == pair_ids[::-1]
+    assert {e["link_id"] for e in page["events"][-2:]} == {run["link_id"]}
+    # Nothing older remains: the grown page already reached the end.
+    assert page["next_cursor"] is None
+
+    # The keyset contract still holds over the whole history: strictly
+    # descending, every event exactly once.
+    all_ids = [
+        e["event_id"] for page_ in _walk_pages(limit=10) for e in page_["events"]
+    ]
+    assert all_ids == sorted(all_ids, reverse=True)
+    assert len(all_ids) == len(set(all_ids)) == 11
+
+
+def test_linked_pair_complete_when_older_events_follow(services):
+    """The boundary completion does not swallow or repeat older events."""
+    for _ in range(3):
+        _execute(services, EXTRA)
+    run = _linked(services)
+    for _ in range(9):
+        _execute(services, EXTRA)
+    pair_ids = sorted(ev["event_id"] for ev in run["events"])
+
+    page1 = history.list_history(None, 10)
+    ids1 = [e["event_id"] for e in page1["events"]]
+    assert len(ids1) == 11  # pair pulled onto the first page
+    assert ids1[-2:] == pair_ids[::-1]
+    assert page1["next_cursor"] == pair_ids[0]
+
+    # The next page starts STRICTLY older than the pair's last event: no
+    # overlap with the grown first page.
+    page2 = history.list_history(str(page1["next_cursor"]), 10)
+    ids2 = [e["event_id"] for e in page2["events"]]
+    assert len(ids2) == 3
+    assert all(i < pair_ids[0] for i in ids2)
+    assert page2["next_cursor"] is None
+    assert not set(ids1) & set(ids2)
+
+
+# ------------------------------------------------------------- invalid cursor
+
+
 def test_invalid_cursor_rejected(services):
     _execute(services, LIFT)
     for bad in ("abc", "1.5", "-3", "0", "", "  ", "12x",
+                # Unicode digits: str.isdigit() accepts them but they can
+                # never be an event id handed out as next_cursor — and
+                # superscripts even crash int() if let through.
+                "¹²³", "１２３", "١٢٣",
                 "99999999999999999999999999"):  # beyond the bigint range
         with pytest.raises(Exception) as ei:
             history.list_history(bad)
@@ -276,6 +340,12 @@ def test_http_history_flow_and_error_envelope(client):
     detail = r.json()["detail"]
     assert detail["code"] == "history_cursor_invalid"
     assert detail["message"]
+
+    # Superscript digits pass str.isdigit() but are not event ids: the same
+    # recognisable 400, never an unhandled 500.
+    r = client.get("/api/history", params={"cursor": "¹²³"})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "history_cursor_invalid"
 
     # The invalid call changed nothing: the same page is still served.
     assert client.get("/api/history").json()["events"] == [event]

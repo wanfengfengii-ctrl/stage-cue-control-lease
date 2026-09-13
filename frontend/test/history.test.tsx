@@ -51,6 +51,20 @@ async function executeViaApi(actionId: string, holder = "联排控制席") {
   expect(out.status).toBe(200);
 }
 
+/** Execute the lift+hoist pair as one linked run through the mock API. */
+async function linkedViaApi(holder = "联排控制席"): Promise<string> {
+  const liftLease = await post(`/api/actions/${LIFT}/lease`, { holder });
+  const hoistLease = await post(`/api/actions/${HOIST}/lease`, { holder });
+  const out = await post(`/api/actions/execute-linked`, {
+    items: [
+      { action_id: LIFT, token: liftLease.body.token },
+      { action_id: HOIST, token: hoistLease.body.token },
+    ],
+  });
+  expect(out.status).toBe(200);
+  return out.body.link_id as string;
+}
+
 async function openHistory() {
   fireEvent.click(screen.getByTestId("btn-history-open"));
   await waitFor(() =>
@@ -261,6 +275,75 @@ describe("App execution history (执行历史)", () => {
     ]);
     expect(new Set(rowEventIds()).size).toBe(total);
     expect(screen.queryByTestId("history-tail-error")).toBeNull();
+    expect(screen.getByTestId("history-end")).toHaveTextContent(
+      `已加载全部 ${total} 条执行记录`,
+    );
+  });
+
+  it("keeps a linked run whole when it straddles the page boundary", async () => {
+    await renderConsole();
+    // A linked run first, then nine singles: in newest-first order the
+    // pair's two events sit exactly across the 10-row page boundary
+    // (positions 10 and 11). The first screen must show the WHOLE group.
+    const linkId = await linkedViaApi();
+    for (let i = 0; i < HISTORY_PAGE_SIZE - 1; i++) {
+      await executeViaApi(LIFT);
+    }
+
+    await openHistory();
+    // The page grows by one so the pair is complete: 9 singles + 2 linked.
+    await waitFor(() =>
+      expect(historyRows()).toHaveLength(HISTORY_PAGE_SIZE + 1),
+    );
+    const ids = rowEventIds();
+    expect(new Set(ids).size).toBe(ids.length);
+
+    // Both events of the linked run render adjacent inside one group — the
+    // first screen never shows a broken one-action group.
+    const group = screen.getByTestId("history-group");
+    expect(group).toHaveAttribute("data-link-id", linkId);
+    const groupedIds = within(group)
+      .getAllByTestId("history-event")
+      .map((r) => r.getAttribute("data-event-id"));
+    expect(groupedIds).toEqual(["2", "1"]);
+    expect(
+      within(group).getByTestId("history-group-badge"),
+    ).toHaveTextContent(/2 个动作同属一次联动/);
+
+    // The grown page already reached the oldest record.
+    expect(screen.queryByTestId("btn-history-more")).toBeNull();
+    expect(screen.getByTestId("history-end")).toHaveTextContent(
+      `已加载全部 ${HISTORY_PAGE_SIZE + 1} 条执行记录`,
+    );
+  });
+
+  it("never appends the same event twice on rapid load-more clicks", async () => {
+    await renderConsole();
+    const total = HISTORY_PAGE_SIZE + 4;
+    for (let i = 0; i < total; i++) {
+      await executeViaApi(LIFT);
+    }
+
+    await openHistory();
+    await waitFor(() =>
+      expect(historyRows()).toHaveLength(HISTORY_PAGE_SIZE),
+    );
+
+    // Rapid consecutive clicks, dispatched in the SAME synchronous task —
+    // before React can commit the "loading" state and disable the button.
+    // (fireEvent would flush state between clicks and miss the race that
+    // real rapid clicking hits.)
+    const more = screen.getByTestId("btn-history-more");
+    for (let i = 0; i < 3; i++) {
+      more.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    }
+
+    // Every historical event appears exactly once, still strictly
+    // descending, and the list announces its end.
+    await waitFor(() => expect(historyRows()).toHaveLength(total));
+    const ids = rowEventIds();
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toEqual([...ids].sort((a, b) => Number(b) - Number(a)));
     expect(screen.getByTestId("history-end")).toHaveTextContent(
       `已加载全部 ${total} 条执行记录`,
     );

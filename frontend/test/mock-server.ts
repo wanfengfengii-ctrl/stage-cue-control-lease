@@ -434,7 +434,18 @@ export class MockServer {
     const older =
       cursor === null ? sorted : sorted.filter((e) => e.event_id < cursor!);
     const page = older.slice(0, limit);
-    const hasMore = older.length > limit;
+    // Mirrors the real service: a linked run is never split by the page
+    // boundary — when the next older event shares the page's last link id,
+    // it is pulled onto this page so the pair stays complete and adjacent.
+    if (
+      older.length > page.length &&
+      page.length > 0 &&
+      page[page.length - 1].link_id !== null &&
+      older[page.length].link_id === page[page.length - 1].link_id
+    ) {
+      page.push(older[page.length]);
+    }
+    const hasMore = older.length > page.length;
     const events = page.map((e) => ({
       event_id: e.event_id,
       action_id: e.action_id,
