@@ -44,10 +44,7 @@ def _new_link_id() -> str:
 
 def _lock_action(conn: psycopg.Connection, action_id: str):
     """Row-lock the action; returns its id or None if it does not exist."""
-    return conn.execute(
-        "SELECT id FROM actions WHERE id = %s FOR UPDATE",
-        (action_id,),
-    ).fetchone()
+    return db.lock_action(conn, action_id)
 
 
 def _latest_lease(conn: psycopg.Connection, action_id: str):

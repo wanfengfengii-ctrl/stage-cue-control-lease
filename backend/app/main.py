@@ -7,7 +7,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import config, db, leases, sessions
+from . import anomalies, config, db, leases, sessions
 
 app = FastAPI(title="舞台联排控制权交接台", version="1.0.0")
 
@@ -47,6 +47,18 @@ class SessionTransitionBody(BaseModel):
     # Defaults to "" so a missing name is judged uniformly by the service
     # (400 invalid_name) instead of a schema-level 422.
     name: str = Field(default="", description="场次名称（start 时必填）")
+
+
+class AnomalyReportBody(BaseModel):
+    # Defaults to "" so missing fields are judged uniformly by the service
+    # (400 invalid_anomaly) instead of a schema-level 422.
+    category: str = Field(default="", description="异常类别：equipment/operation/environment/other")
+    description: str = Field(default="", description="现场异常说明，供下一班确认")
+    reporter: str = Field(default="", description="报告席位名称")
+
+
+class AnomalyConfirmBody(BaseModel):
+    confirmer: str = Field(default="", description="确认席位名称")
 
 
 @app.on_event("startup")
@@ -198,6 +210,47 @@ def execute_linked_actions(body: LinkedExecuteBody):
                 if aid in config.ACTION_IDS
             },
         })
+
+
+def _anomaly_error(exc: anomalies.AnomalyError, action_id: str):
+    raise HTTPException(status_code=exc.status, detail={
+        "code": exc.code,
+        "message": exc.message,
+        # Repeat report/confirm: the CURRENT record rides along so the other
+        # seat renders the authoritative pending/confirmed state.
+        "anomaly": exc.anomaly,
+        "state": leases.get_action_state(action_id)
+        if action_id in config.ACTION_IDS
+        else None,
+    })
+
+
+@app.post("/api/actions/{action_id}/anomaly")
+def report_anomaly(action_id: str, body: AnomalyReportBody):
+    """Report the on-site anomaly of the action's most recent executed event.
+
+    Creates exactly one pending record on that event; a repeat report is a
+    business error carrying the existing record and never overwrites it.
+    """
+    try:
+        return anomalies.report(
+            action_id, body.category, body.description, body.reporter
+        )
+    except anomalies.AnomalyError as exc:
+        _anomaly_error(exc, action_id)
+
+
+@app.post("/api/actions/{action_id}/anomaly/confirm")
+def confirm_anomaly(action_id: str, body: AnomalyConfirmBody):
+    """Another seat acknowledges the pending record (pending -> confirmed).
+
+    Only that one transition is legal; a repeat confirmation returns the
+    current record and never re-stamps the first confirmer/time.
+    """
+    try:
+        return anomalies.confirm(action_id, body.confirmer)
+    except anomalies.AnomalyError as exc:
+        _anomaly_error(exc, action_id)
 
 
 def _iso_now() -> str:

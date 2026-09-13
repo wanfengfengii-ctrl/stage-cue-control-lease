@@ -1,9 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, type ActionState, type ActionsSnapshot, type ApiError } from "./api";
+import {
+  api,
+  type ActionState,
+  type ActionsSnapshot,
+  type AnomalyCategory,
+  type ApiError,
+} from "./api";
 import { detectTakeover, formatClock, remainingSeconds } from "./lease";
 
 const TOKEN_KEY = "handover.tokens.v1";
 const SEAT_KEY = "handover.seat.v1";
+
+// Anomaly categories offered on the card; the stored value is the code, the
+// snapshot/poll renders this Chinese label.
+export const ANOMALY_CATEGORY_LABELS: Record<AnomalyCategory, string> = {
+  equipment: "设备异常",
+  operation: "操作异常",
+  environment: "环境异常",
+  other: "其他异常",
+};
+const ANOMALY_CATEGORIES = Object.keys(
+  ANOMALY_CATEGORY_LABELS,
+) as AnomalyCategory[];
 
 // Device each action physically belongs to. A linked cue coordinates the
 // lifting platform WITH the flying hoist, so a valid linked pair is exactly
@@ -325,6 +343,7 @@ export default function App() {
           onRelease={() => onRelease(state.action_id)}
           onExecute={() => onExecute(state.action_id)}
           onForget={() => onForget(state.action_id)}
+          onAnomalyChanged={() => void refresh()}
         />
       )),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -461,6 +480,7 @@ interface RowProps {
   onRelease: () => void;
   onExecute: () => void;
   onForget: () => void;
+  onAnomalyChanged: () => void;
 }
 
 function ActionRow(props: RowProps) {
@@ -611,11 +631,216 @@ function ActionRow(props: RowProps) {
           本页面保存的是旧令牌，任何操作都会被服务端拒绝。
         </p>
       )}
+      {/* The anomaly record follows the card's most recent execution event;
+          a key on that event id remounts the panel when a new event arrives,
+          so an unsubmitted form or old state can never bleed across events. */}
+      {state.last_event_id != null && (
+        <AnomalyPanel
+          key={state.last_event_id}
+          state={state}
+          seat={mySeat}
+          onChanged={props.onAnomalyChanged}
+        />
+      )}
       {props.notice && (
         <p className={`notice ${props.notice.kind}`} data-testid="notice">
           {props.notice.text}
         </p>
       )}
     </article>
+  );
+}
+
+interface AnomalyPanelProps {
+  state: ActionState;
+  seat: string;
+  onChanged: () => void;
+}
+
+function AnomalyPanel({ state, seat, onChanged }: AnomalyPanelProps) {
+  const record = state.anomaly;
+  const [open, setOpen] = useState(false);
+  const [category, setCategory] = useState<AnomalyCategory>("equipment");
+  const [description, setDescription] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+
+  const submitReport = async () => {
+    // Inline feedback for a blank description: no request is sent.
+    if (!description.trim()) {
+      setFormError("异常说明不能为空，请填写现场异常情况。");
+      return;
+    }
+    setFormError(null);
+    setSubmitting(true);
+    try {
+      await api.reportAnomaly(state.action_id, {
+        category,
+        description: description.trim(),
+        reporter: seat,
+      });
+      setOpen(false);
+      setDescription("");
+      onChanged();
+    } catch (e) {
+      const err = e as ApiError;
+      if (err.code === "anomaly_exists") {
+        // Another seat reported first: the record rides along; poll shows it.
+        setOpen(false);
+        onChanged();
+      } else {
+        setFormError(err.message);
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const confirmRecord = async () => {
+    setConfirming(true);
+    try {
+      await api.confirmAnomaly(state.action_id, seat);
+      onChanged();
+    } catch (e) {
+      const err = e as ApiError;
+      // anomaly_confirmed / anomaly_not_found: the polled snapshot is the
+      // authority — refresh to render what the server already holds.
+      if (err.code === "anomaly_confirmed" || err.code === "anomaly_not_found") {
+        onChanged();
+      } else {
+        setFormError(err.message);
+      }
+    } finally {
+      setConfirming(false);
+    }
+  };
+
+  return (
+    <div className="anomaly" data-testid="anomaly-panel">
+      {!record && !open && (
+        <button
+          type="button"
+          data-testid="btn-anomaly-open"
+          onClick={() => {
+            setFormError(null);
+            setOpen(true);
+          }}
+        >
+          报告异常（最近一次执行事件）
+        </button>
+      )}
+
+      {!record && open && (
+        <div className="anomaly-form" data-testid="anomaly-form">
+          <label>
+            异常类别
+            <select
+              data-testid="anomaly-category"
+              value={category}
+              onChange={(e) => setCategory(e.target.value as AnomalyCategory)}
+            >
+              {ANOMALY_CATEGORIES.map((c) => (
+                <option key={c} value={c}>
+                  {ANOMALY_CATEGORY_LABELS[c]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <textarea
+            data-testid="anomaly-description"
+            value={description}
+            placeholder="填写现场异常情况，供下一班确认留痕"
+            rows={2}
+            maxLength={500}
+            onChange={(e) => {
+              setDescription(e.target.value);
+              if (formError) setFormError(null);
+            }}
+          />
+          {formError && (
+            <p className="notice error" data-testid="anomaly-error">
+              {formError}
+            </p>
+          )}
+          <div className="anomaly-actions">
+            <button
+              type="button"
+              className="danger"
+              data-testid="btn-anomaly-submit"
+              disabled={submitting}
+              onClick={submitReport}
+            >
+              提交异常报告
+            </button>
+            <button
+              type="button"
+              data-testid="btn-anomaly-cancel"
+              disabled={submitting}
+              onClick={() => {
+                setOpen(false);
+                setFormError(null);
+              }}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+
+      {record && (
+        <div
+          className={`anomaly-record ${record.status}`}
+          data-testid="anomaly-record"
+          data-status={record.status}
+        >
+          <div className="anomaly-head">
+            <span className="anomaly-tag" data-testid="anomaly-category-text">
+              {ANOMALY_CATEGORY_LABELS[record.category as AnomalyCategory] ??
+                record.category}
+            </span>
+            <span className="anomaly-status" data-testid="anomaly-status">
+              {record.status === "pending" ? "待确认" : "已确认"}
+            </span>
+          </div>
+          <p className="anomaly-text" data-testid="anomaly-description-text">
+            {record.description}
+          </p>
+          <div className="anomaly-meta">
+            <span data-testid="anomaly-reporter">
+              报告人：{record.reported_by}
+            </span>
+            <span data-testid="anomaly-reported-at">
+              报告时间：{formatClock(record.reported_at)} UTC
+            </span>
+          </div>
+          {record.status === "pending" ? (
+            <button
+              type="button"
+              className="primary"
+              data-testid="btn-anomaly-confirm"
+              disabled={confirming}
+              onClick={confirmRecord}
+            >
+              下一班确认已看到
+            </button>
+          ) : (
+            <div className="anomaly-meta" data-testid="anomaly-confirmation">
+              <span data-testid="anomaly-confirmer">
+                确认席位：{record.confirmed_by}
+              </span>
+              <span data-testid="anomaly-confirmed-at">
+                确认时间：{formatClock(record.confirmed_at)} UTC
+              </span>
+            </div>
+          )}
+          {formError && (
+            <p className="notice error" data-testid="anomaly-error">
+              {formError}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
   );
 }

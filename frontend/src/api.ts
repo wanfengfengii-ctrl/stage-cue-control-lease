@@ -1,6 +1,20 @@
 // Typed API client. No fake/mock interface: every call hits the real
 // FastAPI service over HTTP.
 
+export type AnomalyCategory = "equipment" | "operation" | "environment" | "other";
+
+export interface AnomalyRecord {
+  id: number;
+  event_id: number;
+  category: AnomalyCategory | string;
+  description: string;
+  reported_by: string;
+  reported_at: string;
+  status: "pending" | "confirmed";
+  confirmed_by: string | null;
+  confirmed_at: string | null;
+}
+
 export interface ActionState {
   action_id: string;
   label: string;
@@ -13,6 +27,10 @@ export interface ActionState {
   event_count: number;
   /** Latest linked-execution id involving this action; null if never linked. */
   last_link_id: string | null;
+  /** Id of the most recent execution event the card follows. */
+  last_event_id: number | null;
+  /** Anomaly record of the most recent execution event, if reported. */
+  anomaly: AnomalyRecord | null;
   server_time: string;
 }
 
@@ -56,6 +74,8 @@ export interface ApiError extends Error {
   states: Record<string, ActionState> | null;
   /** Session transition errors: the current session summary, if any. */
   session: SessionSummary | null;
+  /** Anomaly report/confirm errors: the current record, if one exists. */
+  anomaly: AnomalyRecord | null;
 }
 
 function makeError(status: number, body: any): ApiError {
@@ -72,6 +92,7 @@ function makeError(status: number, body: any): ApiError {
   err.action_id = detail?.action_id ?? null;
   err.states = detail?.states ?? null;
   err.session = detail?.session ?? null;
+  err.anomaly = detail?.anomaly ?? null;
   return err;
 }
 
@@ -145,4 +166,23 @@ export const api = {
 
   currentSession: () =>
     request<{ session: SessionSummary | null }>("/api/sessions/current"),
+
+  reportAnomaly: (
+    actionId: string,
+    body: {
+      category: AnomalyCategory;
+      description: string;
+      reporter: string;
+    },
+  ) =>
+    request<{ anomaly: AnomalyRecord; state: ActionState }>(
+      `/api/actions/${actionId}/anomaly`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
+  confirmAnomaly: (actionId: string, confirmer: string) =>
+    request<{ anomaly: AnomalyRecord; state: ActionState }>(
+      `/api/actions/${actionId}/anomaly/confirm`,
+      { method: "POST", body: JSON.stringify({ confirmer }) },
+    ),
 };

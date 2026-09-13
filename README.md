@@ -54,17 +54,24 @@ docker compose down -v       # 连同 PostgreSQL 数据一并删除
    赢家、独立连接池同样串行化）、**过期边界**（`now == expires_at` 即失效、
    旧令牌迟到的续期 / 释放 / 执行全部拒绝且新租约不变、执行只写一次事件）、
    **联动执行**（两条事件共享联动标识且各计数一次、交换动作顺序结果一致、
-   并发的联动与单动作执行只有一方提交、一枚旧令牌使整次操作无副作用）与
+   并发的联动与单动作执行只有一方提交、一枚旧令牌使整次操作无副作用）、
    **场次归属**（单动作与联动事件在原事务内计入当前场次、并发开始仅一个
    进行中场次、重复开始 / 空白名称 / 无进行中场次时结束均为可识别业务错误
-   且不改动事件、结束后摘要冻结且后续动作不再计入）；
-2. Vitest：倒计时边界、接管 / 旧令牌界面逻辑，以及场次全流程组件测试
-   （开始 → 两类动作执行 → 结束后摘要冻结）；
+   且不改动事件、结束后摘要冻结且后续动作不再计入）与**现场异常留痕**
+   （异常挂在最近一次执行事件上、重复报告 / 确认携带当前记录返回业务错误且
+   首次数据不被改写、16 路并发确认仅一人写入、新事件到来后旧记录保留但卡片
+   不再显示、重新申请 / 释放 / 单动作 / 联动均不覆盖旧记录）；
+2. Vitest：倒计时边界、接管 / 旧令牌界面逻辑，场次全流程组件测试
+   （开始 → 两类动作执行 → 结束后摘要冻结），以及异常报告 / 确认组件测试
+   （提交成功后轮询展示报告人与时间、空白说明就地反馈且不发请求、新事件
+   切换卡片后不误显旧异常）；
 3. Playwright：两个真实浏览器上下文模拟双控制席——同时争抢只有一人持有、
    失联满 30 秒后另一席立即接管、旧页面再次点击明确显示「控制权已失效」；
    另有双动作联动用例（一席持两动作一次联动成功、旧令牌联动被 409
-   拒绝且另一租约不受影响），以及场次用例（控制台开始场次 → 单动作 +
-   联动各执行一次 → 结束场次 → 摘要固定且随后执行不再计入）。
+   拒绝且另一租约不受影响）、场次用例（控制台开始场次 → 单动作 +
+   联动各执行一次 → 结束场次 → 摘要固定且随后执行不再计入），以及异常
+   交接用例（一席执行并报告异常、另一浏览器看到待确认记录后确认、两侧
+   刷新后仍展示已确认结果与确认席位）。
 
 ```bash
 docker compose --profile verify run --build --rm verify
@@ -170,6 +177,33 @@ pytest 用 24 线程共享连接池、16 线程各自独立连接池两种方式
   请求结束 `409 no_active_session`；错误响应的 `detail.session` 附带当前
   场次摘要便于界面重渲染。
 
+### 现场异常留痕（报告 → 下一班确认）
+
+演出复盘时，控制席把**某次已执行动作的现场异常留在对应事件上**，并让下一班
+确认已经看到，避免口头交接后无法追溯：
+
+- 动作卡片在该动作**最近一次执行事件**存在后出现「报告异常」入口：选择异常
+  类别（设备 / 操作 / 环境 / 其他）并填写说明后提交，生成一条 `pending`
+  （待确认）记录；空白说明在组件内**就地反馈**、不发送请求；轮询快照在卡片
+  上展示类别、说明、**报告人**与**报告时间**（服务端 UTC）；
+- 记录保存在新表 `action_anomalies` 中，外键关联 `action_events(id)`，
+  且每个事件至多一条（唯一索引从 SQL 层杜绝重复报告）；
+- **另一席**在同一张卡片看到待确认记录后点击「下一班确认已看到」：服务端只
+  允许 `pending → confirmed` 这一种转换（`UPDATE ... WHERE status='pending'`
+  条件更新），保存**确认席位与确认时间**；16 路并发确认也只有一人写入；
+- 重复报告返回 `409 anomaly_exists`、重复确认返回 `409 anomaly_confirmed`，
+  两者都在错误体 `detail.anomaly` 中**携带当前记录**并附 `detail.state`
+  最新快照——失败永远不改写首次数据（后端测试直接核对行内容）；类别无效 /
+  说明或席位空白为 `400 invalid_anomaly`，尚无执行事件时报告为
+  `409 no_execution_event`，没有待确认记录却确认是 `409 anomaly_not_found`；
+- 记录**只追加、不覆盖**：重新申请、释放以及单动作 / 联动执行都不会改写旧
+  记录。卡片快照只跟随**最新事件**的异常——新事件到来后卡片自然切换，
+  `anomaly` 变为 `null`，不会误显上一事件的旧异常（旧行仍在 PostgreSQL 中，
+  可按事件追溯）；
+- 与既有契约一致：报告 / 确认同样先 `SELECT ... FOR UPDATE` 锁定动作行，
+  复用 FastAPI 既有错误信封（`detail.code/message/state`），租约、联动与
+  场次接口字段完全保持兼容（`anomaly`、`last_event_id` 均为新增字段）。
+
 ### 时间只信服务端
 
 - 到期判定全部使用数据库事务内的 `now()`，客户端不能用本地时钟影响结果；
@@ -180,13 +214,15 @@ pytest 用 24 线程共享连接池、16 线程各自独立连接池两种方式
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/actions` | 全部动作快照（短轮询），含 `last_link_id` 与 `session` 场次摘要 |
+| GET | `/api/actions` | 全部动作快照（短轮询），含 `last_link_id`、`last_event_id`、最新事件的 `anomaly` 与 `session` 场次摘要 |
 | GET | `/api/actions/{id}` | 单个动作快照 |
 | POST | `/api/actions/{id}/lease` | 申请（body: `{"holder":"席位名"}`），返回令牌 |
 | POST | `/api/actions/{id}/renew` | 续期 30 秒（body 或 Bearer 携带令牌） |
 | POST | `/api/actions/{id}/release` | 主动释放 |
 | POST | `/api/actions/{id}/execute` | 执行；写且仅写一条动作事件（计入当前场次） |
 | POST | `/api/actions/execute-linked` | 联动执行（body: `{"items":[{"action_id","token"},…]}`），全部成功或全部不变 |
+| POST | `/api/actions/{id}/anomaly` | 为最近一次执行事件报告异常（body: `{"category","description","reporter"}`），生成待确认记录 |
+| POST | `/api/actions/{id}/anomaly/confirm` | 另一席确认已看到（body: `{"confirmer":"席位名"}`），仅允许待确认 → 已确认 |
 | POST | `/api/sessions/transition` | 场次状态转换（body: `{"op":"start","name":…}` / `{"op":"end"}`） |
 | GET | `/api/sessions/current` | 当前场次摘要（进行中或最近已结束），结束后仍可查 |
 
@@ -194,7 +230,12 @@ pytest 用 24 线程共享连接池、16 线程各自独立连接池两种方式
 过期，响应附带最新 `state` 便于界面渲染当前持有者；联动接口以
 `detail.action_id` 指明具体失效动作并附 `states`）、`404`（未知动作）、
 `401`（缺令牌）、`409 session_active`（重复开始场次）、`400 invalid_name`
-（场次名称空白）、`409 no_active_session`（无进行中场次却请求结束）。
+（场次名称空白）、`409 no_active_session`（无进行中场次却请求结束）、
+`400 invalid_anomaly`（异常类别无效 / 说明或席位空白）、
+`409 no_execution_event`（尚无执行事件却报告异常）、
+`409 anomaly_exists`（重复报告，`detail.anomaly` 携带当前记录）、
+`409 anomaly_not_found`（当前事件没有待确认记录）、
+`409 anomaly_confirmed`（重复确认，携带已确认记录与确认席位）。
 
 ## 目录结构
 
@@ -203,14 +244,15 @@ backend/            FastAPI + psycopg + PostgreSQL
   app/main.py         HTTP 路由
   app/leases.py       事务化租约逻辑（FOR UPDATE / 令牌 / 一次性事件）
   app/sessions.py     场次状态转换与摘要（开始 / 结束 / 当前场次）
+  app/anomalies.py    现场异常报告与下一班确认（待确认 → 已确认，只追加）
   app/db.py           连接池、建表、状态快照
-  tests/              pytest：事务竞争、过期边界、HTTP 端到端、场次归属
+  tests/              pytest：事务竞争、过期边界、HTTP 端到端、场次归属、异常留痕
 frontend/           React + Vite + TypeScript
   src/api.ts          类型化 HTTP 客户端（真实接口）
   src/lease.ts        服务端时钟锚定的倒计时（纯函数，单测覆盖边界）
-  src/App.tsx         短轮询控制台（含场次控制入口与本轮摘要）
+  src/App.tsx         短轮询控制台（含场次控制、本轮摘要与卡片异常留痕）
   test/               Vitest 单元 + 组件测试（mock 仅存在于测试目录）
-  e2e/                Playwright 双浏览器交接 + 联动 + 场次用例（真实服务）
+  e2e/                Playwright 双浏览器交接 + 联动 + 场次 + 异常确认用例（真实服务）
 verify/             一次性验收服务的镜像构建与执行脚本
 docker-compose.yml  db / api / web / verify
 ```

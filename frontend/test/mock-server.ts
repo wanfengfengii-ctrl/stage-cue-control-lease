@@ -1,4 +1,4 @@
-import type { ActionState, SessionSummary } from "../src/api";
+import type { ActionState, AnomalyRecord, SessionSummary } from "../src/api";
 
 /**
  * In-memory test double that mirrors the FastAPI lease rules:
@@ -49,6 +49,14 @@ interface SessionRec {
   endedAt: number | null;
 }
 
+interface EventRec {
+  action_id: string;
+  session_id: number | null;
+  event_id: number;
+}
+
+const ANOMALY_CATEGORIES = ["equipment", "operation", "environment", "other"];
+
 export class MockServer {
   leases: Record<string, Lease> = {};
   serverNow = 1_700_000_000_000;
@@ -58,10 +66,16 @@ export class MockServer {
   lastExecutedBy: Record<string, string> = {};
   /** action_id -> link id of the most recent linked execution. */
   links: Record<string, string> = {};
+  /** action_id -> global id of the most recent execution event. */
+  lastEventIds: Record<string, number> = {};
+  /** event_id -> its anomaly record (at most one per event). */
+  anomalies: Record<number, AnomalyRecord> = {};
   sessions: SessionRec[] = [];
   /** Every executed event with the session it was attributed to (if any). */
-  eventLog: { action_id: string; session_id: number | null }[] = [];
+  eventLog: EventRec[] = [];
   private nextSessionId = 1;
+  private nextEventId = 1;
+  private nextAnomalyId = 1;
 
   private activeSession(): SessionRec | undefined {
     return this.sessions.find((s) => s.endedAt === null);
@@ -69,9 +83,12 @@ export class MockServer {
 
   private recordEvent(actionId: string) {
     this.events[actionId] = (this.events[actionId] ?? 0) + 1;
+    const event_id = this.nextEventId++;
+    this.lastEventIds[actionId] = event_id;
     this.eventLog.push({
       action_id: actionId,
       session_id: this.activeSession()?.id ?? null,
+      event_id,
     });
   }
 
@@ -107,6 +124,12 @@ export class MockServer {
     return this.serverNow < l.expiresAt ? l : undefined;
   }
 
+  /** The anomaly attached to the action's most recent event, if any. */
+  private anomalyFor(id: string): AnomalyRecord | null {
+    const eventId = this.lastEventIds[id];
+    return eventId ? this.anomalies[eventId] ?? null : null;
+  }
+
   private state(id: string): ActionState {
     const l = this.live(id);
     return {
@@ -122,6 +145,8 @@ export class MockServer {
       last_executed_by: this.lastExecutedBy[id] ?? null,
       event_count: this.events[id] ?? 0,
       last_link_id: this.links[id] ?? null,
+      last_event_id: this.lastEventIds[id] ?? null,
+      anomaly: this.anomalyFor(id),
       server_time: new Date(this.serverNow).toISOString(),
     };
   }
@@ -272,6 +297,79 @@ export class MockServer {
     return err(400, "invalid_request", "未知的场次操作（仅支持 start / end）");
   }
 
+  /** Mirrors POST /api/actions/{id}/anomaly: one pending record per event. */
+  private handleAnomalyReport(id: string, payload: any) {
+    const category = (payload.category ?? "").trim();
+    const description = (payload.description ?? "").trim();
+    const reporter = (payload.reporter ?? "").trim();
+    const err = (status: number, code: string, message: string, anomaly?: AnomalyRecord) => ({
+      status,
+      body: {
+        detail: {
+          code,
+          message,
+          anomaly: anomaly ?? null,
+          state: this.state(id),
+        },
+      },
+    });
+    if (!ANOMALY_CATEGORIES.includes(category) || !description || !reporter) {
+      return err(400, "invalid_anomaly", "异常类别、说明与报告席位均不能为空");
+    }
+    const eventId = this.lastEventIds[id];
+    if (!eventId) {
+      return err(409, "no_execution_event", "该动作尚无已执行事件，无法报告异常");
+    }
+    const existing = this.anomalies[eventId];
+    if (existing) {
+      return err(409, "anomaly_exists", "该执行事件已存在异常记录，请勿重复报告", existing);
+    }
+    const record: AnomalyRecord = {
+      id: this.nextAnomalyId++,
+      event_id: eventId,
+      category,
+      description,
+      reported_by: reporter,
+      reported_at: new Date(this.serverNow).toISOString(),
+      status: "pending",
+      confirmed_by: null,
+      confirmed_at: null,
+    };
+    this.anomalies[eventId] = record;
+    return { status: 200, body: { anomaly: record, state: this.state(id) } };
+  }
+
+  /** Mirrors POST /api/actions/{id}/anomaly/confirm: pending -> confirmed once. */
+  private handleAnomalyConfirm(id: string, payload: any) {
+    const confirmer = (payload.confirmer ?? "").trim();
+    const err = (status: number, code: string, message: string, anomaly?: AnomalyRecord | null) => ({
+      status,
+      body: {
+        detail: {
+          code,
+          message,
+          anomaly: anomaly ?? null,
+          state: this.state(id),
+        },
+      },
+    });
+    if (!confirmer) {
+      return err(400, "invalid_anomaly", "确认席位不能为空");
+    }
+    const eventId = this.lastEventIds[id];
+    const record = eventId ? this.anomalies[eventId] : undefined;
+    if (!record) {
+      return err(409, "anomaly_not_found", "当前执行事件没有待确认的异常记录");
+    }
+    if (record.status !== "pending") {
+      return err(409, "anomaly_confirmed", "该异常记录已确认，请勿重复确认", record);
+    }
+    record.status = "confirmed";
+    record.confirmed_by = confirmer;
+    record.confirmed_at = new Date(this.serverNow).toISOString();
+    return { status: 200, body: { anomaly: { ...record }, state: this.state(id) } };
+  }
+
   /** Entry point used by the mocked global fetch. */
   handle(url: string, init?: { method?: string; body?: string }) {
     const method = init?.method ?? "GET";
@@ -294,7 +392,17 @@ export class MockServer {
       return this.handleLinked(payload);
     }
 
-    const m = url.match(/\/api\/actions\/([^/]+)(?:\/(lease|renew|release|execute))?$/);
+    // Anomaly confirm likewise before the single-action regex (two segments).
+    let m = url.match(/\/api\/actions\/([^/]+)\/anomaly\/confirm$/);
+    if (m && method === "POST") {
+      return this.handleAnomalyConfirm(m[1], payload);
+    }
+    m = url.match(/\/api\/actions\/([^/]+)\/anomaly$/);
+    if (m && method === "POST") {
+      return this.handleAnomalyReport(m[1], payload);
+    }
+
+    m = url.match(/\/api\/actions\/([^/]+)(?:\/(lease|renew|release|execute))?$/);
     if (!m) return { status: 404, body: { detail: "not found" } };
     const id = m[1];
     const op = m[2];

@@ -80,6 +80,37 @@ CREATE UNIQUE INDEX IF NOT EXISTS rehearsal_sessions_one_active
 -- NULL on events executed outside any session (and on all history).
 ALTER TABLE action_events ADD COLUMN IF NOT EXISTS session_id BIGINT
     REFERENCES rehearsal_sessions(id);
+
+-- On-site anomaly reports (现场异常) attached to the EXECUTED ACTION EVENT
+-- they describe, so a verbal shift handover becomes a traceable record.
+-- A report starts 'pending' (待确认) and the server alone may move it
+-- exactly once to 'confirmed' (已确认), stamping the confirming seat and
+-- time.  One event keeps at most one anomaly ever: a repeat report is a
+-- business error, never an overwrite.  Rows are append-only: re-acquiring,
+-- releasing, or executing (single or linked) never touches old rows.
+CREATE TABLE IF NOT EXISTS action_anomalies (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    action_id     TEXT NOT NULL REFERENCES actions(id),
+    event_id      BIGINT NOT NULL REFERENCES action_events(id),
+    category      TEXT NOT NULL,
+    description   TEXT NOT NULL,
+    reported_by   TEXT NOT NULL,
+    reported_at   TIMESTAMPTZ NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    confirmed_by  TEXT,
+    confirmed_at  TIMESTAMPTZ,
+    -- Exactly one anomaly report per executed event.
+    CONSTRAINT action_anomalies_event_uniq UNIQUE (event_id),
+    -- The only legal transition: pending (nothing stamped) or confirmed
+    -- (both confirming seat and time present).
+    CONSTRAINT action_anomalies_status_check CHECK (
+        (status = 'pending' AND confirmed_by IS NULL
+                             AND confirmed_at IS NULL)
+        OR
+        (status = 'confirmed' AND confirmed_by IS NOT NULL
+                               AND confirmed_at IS NOT NULL)
+    )
+);
 """
 
 
@@ -94,6 +125,19 @@ def active_session_id(conn: psycopg.Connection) -> int | None:
         " WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1"
     ).fetchone()
     return row["id"] if row else None
+
+
+def lock_action(conn: psycopg.Connection, action_id: str):
+    """Row-lock the action (SELECT ... FOR UPDATE); None if it is unknown.
+
+    Every mutating operation on an action takes this lock first, so lease
+    lifecycle, execution and anomaly reports/confirms all serialise on the
+    same row instead of racing between a SELECT and its UPDATE.
+    """
+    return conn.execute(
+        "SELECT id FROM actions WHERE id = %s FOR UPDATE",
+        (action_id,),
+    ).fetchone()
 
 
 def get_pool() -> ConnectionPool:
@@ -144,7 +188,19 @@ _STATE_SELECT = """
            (SELECT e.holder FROM action_events e
              WHERE e.action_id = a.id
              ORDER BY e.id DESC LIMIT 1)
-               AS last_executed_by
+               AS last_executed_by,
+           (SELECT e.id FROM action_events e
+             WHERE e.action_id = a.id
+             ORDER BY e.id DESC LIMIT 1)
+               AS last_event_id,
+           -- The anomaly OF THE LATEST EVENT ONLY (never an older event's:
+           -- once a new execution arrives the card switches to that event
+           -- and must not display the previous round's anomaly).
+           an.id AS anomaly_id, an.event_id AS anomaly_event_id,
+           an.category AS anomaly_category, an.description AS anomaly_description,
+           an.reported_by AS anomaly_reported_by, an.reported_at AS anomaly_reported_at,
+           an.status AS anomaly_status, an.confirmed_by AS anomaly_confirmed_by,
+           an.confirmed_at AS anomaly_confirmed_at
       FROM actions a
       LEFT JOIN LATERAL (
           SELECT * FROM leases
@@ -152,6 +208,14 @@ _STATE_SELECT = """
           ORDER BY id DESC
           LIMIT 1
       ) l ON TRUE
+      LEFT JOIN LATERAL (
+          SELECT n.* FROM action_anomalies n
+          WHERE n.event_id = (
+              SELECT e.id FROM action_events e
+               WHERE e.action_id = a.id
+               ORDER BY e.id DESC LIMIT 1
+          )
+      ) an ON TRUE
 """
 
 
@@ -211,5 +275,33 @@ def state_from_row(row: dict[str, Any] | None, now) -> dict[str, Any]:
         "event_count": row["event_count"],
         # .get(): rows assembled outside _STATE_SELECT (tests) may lack it.
         "last_link_id": row.get("last_link_id"),
+        # The most recent execution event's id and its anomaly (if any).
+        # The card's anomaly UI follows THIS event: a new execution switches
+        # last_event_id and the old anomaly no longer rides along.
+        "last_event_id": row.get("last_event_id"),
+        "anomaly": _anomaly_from_state_row(row),
         "server_time": now.isoformat(),
+    }
+
+
+def _anomaly_from_state_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Serialise the latest event's anomaly out of a _STATE_SELECT row.
+
+    Columns carry the anomaly_ prefix there (LEFT JOIN LATERAL); absent
+    columns (e.g. hand-built rows in tests) simply yield None.
+    """
+    if row.get("anomaly_id") is None:
+        return None
+    return {
+        "id": row["anomaly_id"],
+        "event_id": row["anomaly_event_id"],
+        "category": row["anomaly_category"],
+        "description": row["anomaly_description"],
+        "reported_by": row["anomaly_reported_by"],
+        "reported_at": row["anomaly_reported_at"].isoformat(),
+        "status": row["anomaly_status"],
+        "confirmed_by": row["anomaly_confirmed_by"],
+        "confirmed_at": row["anomaly_confirmed_at"].isoformat()
+        if row["anomaly_confirmed_at"]
+        else None,
     }
