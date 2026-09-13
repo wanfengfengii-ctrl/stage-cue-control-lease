@@ -12,16 +12,35 @@ import { MockServer } from "./mock-server";
 
 const ACTION = "lift_up";
 
+// Stable per-browser-console identities, independent of the editable seat
+// name exactly as in the real app.
+const CONSOLE_ID_KEY = "handover.console-id.v1";
+const CONSOLE_A = "console-test-aaaa";
+const CONSOLE_B = "console-test-bbbb";
+
 const card = () => screen.getByTestId(`action-${ACTION}`);
 const panel = () => within(card()).getByTestId("anomaly-panel");
 
-async function renderConsole(seat = "升降台一席") {
+async function renderConsole(
+  seat = "升降台一席",
+  consoleId: string = CONSOLE_A,
+) {
+  cleanup();
+  sessionStorage.setItem(CONSOLE_ID_KEY, consoleId);
   render(<App />);
   fireEvent.change(screen.getByLabelText("本席名称"), {
     target: { value: seat },
   });
   await waitFor(() =>
     expect(within(card()).getByTestId("btn-acquire")).toBeEnabled(),
+  );
+}
+
+/** Simulate opening the page in ANOTHER browser console (fresh identity). */
+async function reopenConsole(consoleId: string, seat: string) {
+  await renderConsole(seat, consoleId);
+  await waitFor(() =>
+    expect(within(panel()).getByTestId("anomaly-record")).toBeInTheDocument(),
   );
 }
 
@@ -97,19 +116,20 @@ describe("App anomaly report (现场异常) on the latest execution event", () =
     expect(within(record).getByTestId("anomaly-reported-at")).toHaveTextContent(
       /报告时间：\d{2}:\d{2}:\d{2}/,
     );
-    // The report entry is gone while a record exists, and the reporter
-    // themselves gets only the "awaiting the next shift" hint.
+    // The report entry is gone while a record exists, and the reporting
+    // console gets only the "awaiting the next shift" hint.
     expect(within(panel()).queryByTestId("btn-anomaly-open")).toBeNull();
     expect(within(record).queryByTestId("btn-anomaly-confirm")).toBeNull();
     expect(
       within(record).getByTestId("anomaly-await-confirm"),
     ).toBeInTheDocument();
 
-    // Exactly one record, on the latest event.
+    // Exactly one record, on the latest event, stamped with this console id.
     const eventId = server.lastEventIds[ACTION]!;
     expect(Object.keys(server.anomalies)).toHaveLength(1);
     expect(server.anomalies[eventId].status).toBe("pending");
     expect(server.anomalies[eventId].reported_by).toBe("升降台一席");
+    expect(server.anomalies[eventId].reporter_id).toBe(CONSOLE_A);
   });
 
   it("gives inline feedback for a blank description without sending a request", async () => {
@@ -144,41 +164,55 @@ describe("App anomaly report (现场异常) on the latest execution event", () =
     expect(Object.keys(server.anomalies)).toHaveLength(1);
   });
 
-  it("lets the next shift confirm: pending record becomes confirmed with seat and time", async () => {
-    await renderConsole("升降台一席");
+  it("renaming the reporting page to the next shift does not reveal confirm", async () => {
+    await renderConsole("升降台一席", CONSOLE_A);
     await executeOnce();
 
-    // First shift reports.
     fireEvent.click(within(panel()).getByTestId("btn-anomaly-open"));
     fireEvent.change(
       within(panel()).getByTestId("anomaly-description"),
       { target: { value: "限位开关偶发误触发" } },
     );
     fireEvent.click(within(panel()).getByTestId("btn-anomaly-submit"));
-    const record = await within(panel()).findByTestId("anomaly-record");
-    expect(within(record).getByTestId("anomaly-status")).toHaveTextContent(
-      "待确认",
-    );
+    await within(panel()).findByTestId("anomaly-record");
 
-    // The reporting seat itself must NOT be offered a confirm button: only
-    // another seat (the next shift) may acknowledge the report.
-    expect(within(record).queryByTestId("btn-anomaly-confirm")).toBeNull();
-    expect(
-      within(record).getByTestId("anomaly-await-confirm"),
-    ).toBeInTheDocument();
-
-    // The other shift opens the same console (seat name is per browser
-    // session) and acknowledges the record.
+    // The operator edits the SEAT NAME on the SAME page to impersonate the
+    // next shift. The console id is unchanged, so no confirm entry appears —
+    // the bypass is closed in the UI (and rejected by the server too).
     fireEvent.change(screen.getByLabelText("本席名称"), {
       target: { value: "下一班-B" },
     });
     await waitFor(() =>
       expect(
-        within(panel()).getByTestId("btn-anomaly-confirm"),
-      ).toBeInTheDocument(),
+        within(panel()).queryByTestId("btn-anomaly-confirm"),
+      ).toBeNull(),
     );
+    expect(
+      within(panel()).getByTestId("anomaly-await-confirm"),
+    ).toBeInTheDocument();
+    expect(server.anomalies[server.lastEventIds[ACTION]!].status).toBe(
+      "pending",
+    );
+  });
+
+  it("another browser console confirms: record becomes confirmed with seat and time", async () => {
+    // Console A executes and reports.
+    await renderConsole("升降台一席", CONSOLE_A);
+    await executeOnce();
+    fireEvent.click(within(panel()).getByTestId("btn-anomaly-open"));
+    fireEvent.change(
+      within(panel()).getByTestId("anomaly-description"),
+      { target: { value: "限位开关偶发误触发" } },
+    );
+    fireEvent.click(within(panel()).getByTestId("btn-anomaly-submit"));
+    await within(panel()).findByTestId("anomaly-record");
+
+    // A genuinely different browser console (the next shift) opens the page;
+    // even typing the SAME seat name the reporter used, it is another seat.
+    await reopenConsole(CONSOLE_B, "下一班-B");
+    const confirmButton = within(panel()).getByTestId("btn-anomaly-confirm");
     expect(within(panel()).queryByTestId("anomaly-await-confirm")).toBeNull();
-    fireEvent.click(within(record).getByTestId("btn-anomaly-confirm"));
+    fireEvent.click(confirmButton);
 
     await waitFor(() =>
       expect(within(panel()).getByTestId("anomaly-status")).toHaveTextContent(
@@ -202,10 +236,16 @@ describe("App anomaly report (现场异常) on the latest execution event", () =
     expect(
       within(panel()).queryByTestId("btn-anomaly-confirm"),
     ).toBeNull();
+
+    const record = server.anomalies[server.lastEventIds[ACTION]!];
+    expect(record.status).toBe("confirmed");
+    expect(record.confirmed_by).toBe("下一班-B");
+    expect(record.confirmer_id).toBe(CONSOLE_B);
+    expect(record.reporter_id).toBe(CONSOLE_A);
   });
 
   it("switches to the new execution event: old anomaly is hidden but kept", async () => {
-    await renderConsole();
+    await renderConsole("升降台一席", CONSOLE_A);
     await executeOnce();
     const firstEventId = server.lastEventIds[ACTION]!;
 
@@ -217,21 +257,19 @@ describe("App anomaly report (现场异常) on the latest execution event", () =
     fireEvent.click(within(panel()).getByTestId("btn-anomaly-submit"));
     await within(panel()).findByTestId("anomaly-record");
 
-    // The reporter cannot self-confirm; the next shift acknowledges it.
-    fireEvent.change(screen.getByLabelText("本席名称"), {
-      target: { value: "下一班-B" },
-    });
-    fireEvent.click(
-      await within(panel()).findByTestId("btn-anomaly-confirm"),
-    );
+    // The reporting console cannot self-confirm; the next shift's console
+    // acknowledges it.
+    await reopenConsole(CONSOLE_B, "下一班-B");
+    fireEvent.click(within(panel()).getByTestId("btn-anomaly-confirm"));
     await waitFor(() =>
       expect(within(panel()).getByTestId("anomaly-status")).toHaveTextContent(
         "已确认",
       ),
     );
 
-    // A new execution event arrives: the card naturally switches to it and
-    // must not display the previous event's anomaly.
+    // Back on the first console, a new execution arrives: the card switches
+    // naturally to the new event and must not show the previous anomaly.
+    await renderConsole("升降台一席", CONSOLE_A);
     await executeOnce();
     await waitFor(() =>
       expect(within(panel()).queryByTestId("anomaly-record")).toBeNull(),

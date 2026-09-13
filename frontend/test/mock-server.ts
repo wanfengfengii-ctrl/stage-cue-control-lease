@@ -302,6 +302,7 @@ export class MockServer {
     const category = (payload.category ?? "").trim();
     const description = (payload.description ?? "").trim();
     const reporter = (payload.reporter ?? "").trim();
+    const reporterId = (payload.reporter_id ?? "").trim();
     const err = (status: number, code: string, message: string, anomaly?: AnomalyRecord) => ({
       status,
       body: {
@@ -313,8 +314,13 @@ export class MockServer {
         },
       },
     });
-    if (!ANOMALY_CATEGORIES.includes(category) || !description || !reporter) {
-      return err(400, "invalid_anomaly", "异常类别、说明与报告席位均不能为空");
+    if (
+      !ANOMALY_CATEGORIES.includes(category) ||
+      !description ||
+      !reporter ||
+      !reporterId
+    ) {
+      return err(400, "invalid_anomaly", "异常类别、说明、报告席位与控制台标识均不能为空");
     }
     const eventId = this.lastEventIds[id];
     if (!eventId) {
@@ -330,9 +336,11 @@ export class MockServer {
       category,
       description,
       reported_by: reporter,
+      reporter_id: reporterId,
       reported_at: new Date(this.serverNow).toISOString(),
       status: "pending",
       confirmed_by: null,
+      confirmer_id: null,
       confirmed_at: null,
     };
     this.anomalies[eventId] = record;
@@ -342,6 +350,7 @@ export class MockServer {
   /** Mirrors POST /api/actions/{id}/anomaly/confirm: pending -> confirmed once. */
   private handleAnomalyConfirm(id: string, payload: any) {
     const confirmer = (payload.confirmer ?? "").trim();
+    const confirmerId = (payload.confirmer_id ?? "").trim();
     const err = (status: number, code: string, message: string, anomaly?: AnomalyRecord | null) => ({
       status,
       body: {
@@ -353,16 +362,17 @@ export class MockServer {
         },
       },
     });
-    if (!confirmer) {
-      return err(400, "invalid_anomaly", "确认席位不能为空");
+    if (!confirmer || !confirmerId) {
+      return err(400, "invalid_anomaly", "确认席位与控制台标识不能为空");
     }
     const eventId = this.lastEventIds[id];
     const record = eventId ? this.anomalies[eventId] : undefined;
     if (!record) {
       return err(409, "anomaly_not_found", "当前执行事件没有待确认的异常记录");
     }
-    // Only ANOTHER seat (the next shift) may acknowledge the report.
-    if (record.reported_by === confirmer) {
+    // Only ANOTHER browser console (stable id, not the editable seat name)
+    // may acknowledge the report.
+    if (record.reporter_id === confirmerId) {
       return err(
         409,
         "anomaly_self_confirm",
@@ -375,6 +385,7 @@ export class MockServer {
     }
     record.status = "confirmed";
     record.confirmed_by = confirmer;
+    record.confirmer_id = confirmerId;
     record.confirmed_at = new Date(this.serverNow).toISOString();
     return { status: 200, body: { anomaly: { ...record }, state: this.state(id) } };
   }

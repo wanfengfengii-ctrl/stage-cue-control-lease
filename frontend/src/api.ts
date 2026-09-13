@@ -9,9 +9,13 @@ export interface AnomalyRecord {
   category: AnomalyCategory | string;
   description: string;
   reported_by: string;
+  /** Stable identity of the reporting console (independent of seat name). */
+  reporter_id: string;
   reported_at: string;
   status: "pending" | "confirmed";
   confirmed_by: string | null;
+  /** Stable identity of the confirming console. */
+  confirmer_id: string | null;
   confirmed_at: string | null;
 }
 
@@ -173,6 +177,7 @@ export const api = {
       category: AnomalyCategory;
       description: string;
       reporter: string;
+      reporter_id: string;
     },
   ) =>
     request<{ anomaly: AnomalyRecord; state: ActionState }>(
@@ -180,9 +185,12 @@ export const api = {
       { method: "POST", body: JSON.stringify(body) },
     ),
 
-  confirmAnomaly: (actionId: string, confirmer: string) =>
+  confirmAnomaly: (actionId: string, confirmer: string, confirmerId: string) =>
     request<{ anomaly: AnomalyRecord; state: ActionState }>(
       `/api/actions/${actionId}/anomaly/confirm`,
-      { method: "POST", body: JSON.stringify({ confirmer }) },
+      {
+        method: "POST",
+        body: JSON.stringify({ confirmer, confirmer_id: confirmerId }),
+      },
     ),
 };

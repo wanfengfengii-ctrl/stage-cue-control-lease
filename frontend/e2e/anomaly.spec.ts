@@ -54,22 +54,36 @@ test("one seat reports an anomaly; the other seat confirms; result survives refr
   await expect(panelA.getByTestId("anomaly-reporter")).toContainText("异常报告席-A");
   await expect(panelA.getByTestId("anomaly-reported-at")).toContainText("报告时间：");
 
-  // The reporting seat itself cannot acknowledge its own report — the
-  // server only accepts confirmation from ANOTHER seat.
+  // The reporting console itself cannot acknowledge its own report — the
+  // server only accepts confirmation from ANOTHER console.
   await expect(panelA.getByTestId("btn-anomaly-confirm")).toHaveCount(0);
   await expect(panelA.getByTestId("anomaly-await-confirm")).toBeVisible();
 
-  // Even a direct request from the reporting seat is rejected by the
-  // server and leaves the record pending and unstamped.
+  // The reported bypass: rename THIS page to the next shift. The console's
+  // stable id is unchanged, so no confirm button appears.
+  await a.page.getByLabel("本席名称").fill("接班确认席-B");
+  await a.page.waitForTimeout(300);
+  await expect(panelA.getByTestId("btn-anomaly-confirm")).toHaveCount(0);
+  await expect(panelA.getByTestId("anomaly-await-confirm")).toBeVisible();
+
+  // A direct request with the renamed seat name but the SAME browser-console
+  // id is still rejected and leaves the record pending and unstamped.
+  const consoleIdA = await a.page.evaluate(() =>
+    sessionStorage.getItem("handover.console-id.v1"),
+  );
+  expect(consoleIdA).toBeTruthy();
   const selfConfirm = await a.page.request.post(
     `/api/actions/${ACTION}/anomaly/confirm`,
-    { data: { confirmer: "异常报告席-A" } },
+    { data: { confirmer: "接班确认席-B", confirmer_id: consoleIdA } },
   );
   expect(selfConfirm.status()).toBe(409);
   const selfDetail = (await selfConfirm.json()).detail;
   expect(selfDetail.code).toBe("anomaly_self_confirm");
   expect(selfDetail.anomaly.status).toBe("pending");
   expect(selfDetail.anomaly.confirmed_by).toBeNull();
+
+  // Restore A's display name so the two seats stay distinguishable.
+  await a.page.getByLabel("本席名称").fill("异常报告席-A");
 
   // ---- Seat B: second browser sees the pending record --------------------
   const b = await openSeat(browser, "接班确认席-B");

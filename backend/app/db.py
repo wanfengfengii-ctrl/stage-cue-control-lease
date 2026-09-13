@@ -95,9 +95,13 @@ CREATE TABLE IF NOT EXISTS action_anomalies (
     category      TEXT NOT NULL,
     description   TEXT NOT NULL,
     reported_by   TEXT NOT NULL,
+    -- Stable identity of the reporting browser console (independent of the
+    -- freely editable seat NAME): only a DIFFERENT console id may confirm.
+    reporter_id   TEXT NOT NULL,
     reported_at   TIMESTAMPTZ NOT NULL,
     status        TEXT NOT NULL DEFAULT 'pending',
     confirmed_by  TEXT,
+    confirmer_id  TEXT,
     confirmed_at  TIMESTAMPTZ,
     -- Exactly one anomaly report per executed event.
     CONSTRAINT action_anomalies_event_uniq UNIQUE (event_id),
@@ -105,12 +109,17 @@ CREATE TABLE IF NOT EXISTS action_anomalies (
     -- (both confirming seat and time present).
     CONSTRAINT action_anomalies_status_check CHECK (
         (status = 'pending' AND confirmed_by IS NULL
+                             AND confirmer_id IS NULL
                              AND confirmed_at IS NULL)
         OR
         (status = 'confirmed' AND confirmed_by IS NOT NULL
+                               AND confirmer_id IS NOT NULL
                                AND confirmed_at IS NOT NULL)
     )
 );
+-- Migrations for databases created before console identities existed.
+ALTER TABLE action_anomalies ADD COLUMN IF NOT EXISTS reporter_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE action_anomalies ADD COLUMN IF NOT EXISTS confirmer_id TEXT;
 """
 
 
@@ -198,8 +207,10 @@ _STATE_SELECT = """
            -- and must not display the previous round's anomaly).
            an.id AS anomaly_id, an.event_id AS anomaly_event_id,
            an.category AS anomaly_category, an.description AS anomaly_description,
-           an.reported_by AS anomaly_reported_by, an.reported_at AS anomaly_reported_at,
+           an.reported_by AS anomaly_reported_by, an.reporter_id AS anomaly_reporter_id,
+           an.reported_at AS anomaly_reported_at,
            an.status AS anomaly_status, an.confirmed_by AS anomaly_confirmed_by,
+           an.confirmer_id AS anomaly_confirmer_id,
            an.confirmed_at AS anomaly_confirmed_at
       FROM actions a
       LEFT JOIN LATERAL (
@@ -298,9 +309,11 @@ def _anomaly_from_state_row(row: dict[str, Any]) -> dict[str, Any] | None:
         "category": row["anomaly_category"],
         "description": row["anomaly_description"],
         "reported_by": row["anomaly_reported_by"],
+        "reporter_id": row["anomaly_reporter_id"],
         "reported_at": row["anomaly_reported_at"].isoformat(),
         "status": row["anomaly_status"],
         "confirmed_by": row["anomaly_confirmed_by"],
+        "confirmer_id": row["anomaly_confirmer_id"],
         "confirmed_at": row["anomaly_confirmed_at"].isoformat()
         if row["anomaly_confirmed_at"]
         else None,

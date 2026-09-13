@@ -10,6 +10,29 @@ import { detectTakeover, formatClock, remainingSeconds } from "./lease";
 
 const TOKEN_KEY = "handover.tokens.v1";
 const SEAT_KEY = "handover.seat.v1";
+// Stable identity of THIS browser console. It is deliberately separate from
+// the freely editable seat name: the server decides "another seat" by this
+// id when acknowledging an anomaly, so renaming the reporting page to the
+// next shift's name cannot let it confirm its own report.
+const CONSOLE_ID_KEY = "handover.console-id.v1";
+
+function loadOrCreateConsoleId(): string {
+  try {
+    const existing = sessionStorage.getItem(CONSOLE_ID_KEY);
+    if (existing) return existing;
+  } catch {
+    /* sessionStorage unavailable: fall through to a fresh in-memory id */
+  }
+  const id =
+    globalThis.crypto?.randomUUID?.() ??
+    `console-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    sessionStorage.setItem(CONSOLE_ID_KEY, id);
+  } catch {
+    /* private mode etc.: the id still lasts for this page session */
+  }
+  return id;
+}
 
 // Anomaly categories offered on the card; the stored value is the code, the
 // snapshot/poll renders this Chinese label.
@@ -49,6 +72,9 @@ export default function App() {
   const [seat, setSeat] = useState(
     () => sessionStorage.getItem(SEAT_KEY) || "",
   );
+  // Fixed for this browser console; survives seat-name edits in the same
+  // session, so the "another seat only" rule cannot be bypassed by renaming.
+  const [consoleId] = useState(loadOrCreateConsoleId);
   const [snapshot, setSnapshot] = useState<ActionsSnapshot | null>(null);
   const [tokens, setTokens] = useState<Record<string, string>>(loadTokens);
   const [notices, setNotices] = useState<Record<string, Notice>>({});
@@ -344,6 +370,7 @@ export default function App() {
           onExecute={() => onExecute(state.action_id)}
           onForget={() => onForget(state.action_id)}
           onAnomalyChanged={() => void refresh()}
+          consoleId={consoleId}
         />
       )),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -481,6 +508,7 @@ interface RowProps {
   onExecute: () => void;
   onForget: () => void;
   onAnomalyChanged: () => void;
+  consoleId: string;
 }
 
 function ActionRow(props: RowProps) {
@@ -639,6 +667,7 @@ function ActionRow(props: RowProps) {
           key={state.last_event_id}
           state={state}
           seat={mySeat}
+          consoleId={props.consoleId}
           onChanged={props.onAnomalyChanged}
         />
       )}
@@ -654,10 +683,12 @@ function ActionRow(props: RowProps) {
 interface AnomalyPanelProps {
   state: ActionState;
   seat: string;
+  /** Stable identity of this browser console (independent of seat name). */
+  consoleId: string;
   onChanged: () => void;
 }
 
-function AnomalyPanel({ state, seat, onChanged }: AnomalyPanelProps) {
+function AnomalyPanel({ state, seat, consoleId, onChanged }: AnomalyPanelProps) {
   const record = state.anomaly;
   const [open, setOpen] = useState(false);
   const [category, setCategory] = useState<AnomalyCategory>("equipment");
@@ -679,6 +710,7 @@ function AnomalyPanel({ state, seat, onChanged }: AnomalyPanelProps) {
         category,
         description: description.trim(),
         reporter: seat,
+        reporter_id: consoleId,
       });
       setOpen(false);
       setDescription("");
@@ -700,7 +732,7 @@ function AnomalyPanel({ state, seat, onChanged }: AnomalyPanelProps) {
   const confirmRecord = async () => {
     setConfirming(true);
     try {
-      await api.confirmAnomaly(state.action_id, seat);
+      await api.confirmAnomaly(state.action_id, seat, consoleId);
       onChanged();
     } catch (e) {
       const err = e as ApiError;
@@ -818,9 +850,11 @@ function AnomalyPanel({ state, seat, onChanged }: AnomalyPanelProps) {
             </span>
           </div>
           {record.status === "pending" ? (
-            record.reported_by === seat.trim() ? (
-              // The reporting seat can never acknowledge its own report:
-              // only the next shift (another seat) may confirm it.
+            record.reporter_id === consoleId ? (
+              // This console is the reporter: it can never acknowledge its
+              // own report — even after the operator edits the seat name,
+              // this console's stable id is unchanged. Only another console
+              // (the next shift) gets the confirm button.
               <p className="anomaly-await" data-testid="anomaly-await-confirm">
                 已留痕，等待下一班（另一席）确认已看到
               </p>

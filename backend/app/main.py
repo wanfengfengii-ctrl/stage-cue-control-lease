@@ -55,10 +55,14 @@ class AnomalyReportBody(BaseModel):
     category: str = Field(default="", description="异常类别：equipment/operation/environment/other")
     description: str = Field(default="", description="现场异常说明，供下一班确认")
     reporter: str = Field(default="", description="报告席位名称")
+    # Stable identity of the reporting browser console (independent of the
+    # editable seat name); only a different console id may confirm.
+    reporter_id: str = Field(default="", description="报告控制台稳定身份标识")
 
 
 class AnomalyConfirmBody(BaseModel):
     confirmer: str = Field(default="", description="确认席位名称")
+    confirmer_id: str = Field(default="", description="确认控制台稳定身份标识")
 
 
 @app.on_event("startup")
@@ -234,7 +238,11 @@ def report_anomaly(action_id: str, body: AnomalyReportBody):
     """
     try:
         return anomalies.report(
-            action_id, body.category, body.description, body.reporter
+            action_id,
+            body.category,
+            body.description,
+            body.reporter,
+            body.reporter_id,
         )
     except anomalies.AnomalyError as exc:
         _anomaly_error(exc, action_id)
@@ -248,7 +256,7 @@ def confirm_anomaly(action_id: str, body: AnomalyConfirmBody):
     current record and never re-stamps the first confirmer/time.
     """
     try:
-        return anomalies.confirm(action_id, body.confirmer)
+        return anomalies.confirm(action_id, body.confirmer, body.confirmer_id)
     except anomalies.AnomalyError as exc:
         _anomaly_error(exc, action_id)
 

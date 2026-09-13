@@ -8,11 +8,13 @@ have actually seen it — replacing untraceable verbal handovers.
     action_anomalies row in status 'pending' (待确认); the report carries a
     category, a description, the reporting seat and a server-side UTC time.
 
-  confirm（确认）: ANOTHER seat moves the record — and only such a record —
-    from 'pending' to 'confirmed' (已确认); the reporting seat can never
-    confirm its own report (409 anomaly_self_confirm), so the acknowledgement
-    can only come from the next shift. The server stamps the confirming seat
-    and time.  The transition is conditional (UPDATE ... WHERE
+  confirm（确认）: a DIFFERENT browser console moves the record — and only
+    such a record — from 'pending' to 'confirmed' (已确认); the reporting
+    console can never confirm its own report, even after the operator edits
+    the seat NAME, because the check compares the consoles' stable ids
+    (409 anomaly_self_confirm), so the acknowledgement can only come from
+    the next shift's console. The server stamps the confirming seat name,
+    console id and time. The transition is conditional (UPDATE ... WHERE
     status='pending'), so even racing confirms admit exactly one winner.
 
 Both operations row-lock the action first (the same FOR UPDATE lock that
@@ -47,8 +49,9 @@ CATEGORIES: dict[str, str] = {
 #   no_execution_event 409 — no executed event exists to report on yet
 #   anomaly_exists    409 — repeat report on the same event
 #   anomaly_not_found 409 — confirm requested with no pending record on the event
-#   anomaly_self_confirm 409 — the reporting seat tries to confirm its own
-#                        report; only ANOTHER seat (the next shift) may
+#   anomaly_self_confirm 409 — the reporting CONSOLE tries to confirm its own
+#                        report (matched by stable id, not the editable name);
+#                        only another console (the next shift) may confirm
 #   anomaly_confirmed 409 — repeat confirmation; the record is already confirmed
 
 
@@ -82,6 +85,18 @@ def _seat(value: str | None, label: str) -> str:
     return value
 
 
+def _console_id(value: str | None) -> str:
+    """Validate the browser console's stable identity (not the seat name)."""
+    value = (value or "").strip()
+    if not value:
+        raise AnomalyError(
+            "invalid_anomaly", "缺少控制台身份标识，无法判定是否同一席", 400
+        )
+    if len(value) > 128:
+        raise AnomalyError("invalid_anomaly", "控制台身份标识过长", 400)
+    return value
+
+
 def _latest_event_id(conn: psycopg.Connection, action_id: str) -> int | None:
     row = conn.execute(
         "SELECT id FROM action_events WHERE action_id = %s"
@@ -99,7 +114,11 @@ def _fetch_for_event(conn: psycopg.Connection, event_id: int):
 
 
 def report(
-    action_id: str, category: str, description: str, reporter: str
+    action_id: str,
+    category: str,
+    description: str,
+    reporter: str,
+    reporter_id: str,
 ) -> dict[str, Any]:
     """Create the single pending anomaly record for the action's last event.
 
@@ -123,6 +142,7 @@ def report(
             400,
         )
     reporter = _seat(reporter, "报告席位")
+    reporter_id = _console_id(reporter_id)
 
     pool = db.get_pool()
     with pool.connection() as conn:
@@ -153,8 +173,8 @@ def report(
                     """
                     INSERT INTO action_anomalies
                         (action_id, event_id, category, description,
-                         reported_by, reported_at, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+                         reported_by, reporter_id, reported_at, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
                     RETURNING *
                     """,
                     (
@@ -163,6 +183,7 @@ def report(
                         category,
                         description,
                         reporter,
+                        reporter_id,
                         now,
                     ),
                 ).fetchone()
@@ -184,14 +205,20 @@ def report(
     return {"anomaly": _anomaly_from_row(row), "state": state}
 
 
-def confirm(action_id: str, confirmer: str) -> dict[str, Any]:
+def confirm(action_id: str, confirmer: str, confirmer_id: str) -> dict[str, Any]:
     """Move the latest event's anomaly pending -> confirmed, exactly once.
+
+    The self-confirmation check compares STABLE CONSOLE IDS, not the freely
+    editable seat name: renaming the reporting console to "next shift" must
+    not let it acknowledge its own report. Two different consoles happen to
+    share a name are still two distinct seats (distinct ids) and may confirm.
 
     Anything but a pending record on the card's current event is a business
     error carrying the current record; the conditional UPDATE makes a
     duplicate confirmation a no-row match instead of re-stamping.
     """
     confirmer = _seat(confirmer, "确认席位")
+    confirmer_id = _console_id(confirmer_id)
 
     pool = db.get_pool()
     with pool.connection() as conn:
@@ -213,11 +240,11 @@ def confirm(action_id: str, confirmer: str) -> dict[str, Any]:
                     "当前执行事件没有待确认的异常记录",
                     409,
                 )
-            # Only ANOTHER seat — the next shift — may acknowledge the
-            # report. The reporting seat confirming its own anomaly would
-            # defeat the handover trace, so the server rejects it even if the
-            # console mistakenly offers the button.
-            if record["reported_by"] == confirmer:
+            # Only ANOTHER browser console — the next shift's — may
+            # acknowledge the report. The check uses the stable console id,
+            # NOT the editable seat name: renaming this page cannot turn the
+            # reporter into the confirmer.
+            if record["reporter_id"] == confirmer_id:
                 raise AnomalyError(
                     "anomaly_self_confirm",
                     "报告席位不能自行确认，请由下一班（另一席）确认已看到",
@@ -236,11 +263,12 @@ def confirm(action_id: str, confirmer: str) -> dict[str, Any]:
                 UPDATE action_anomalies
                    SET status = 'confirmed',
                        confirmed_by = %s,
+                       confirmer_id = %s,
                        confirmed_at = %s
                  WHERE id = %s AND status = 'pending'
                 RETURNING *
                 """,
-                (confirmer, now, record["id"]),
+                (confirmer, confirmer_id, now, record["id"]),
             ).fetchone()
             if row is None:
                 # Lost a race against another confirming seat: report the
@@ -263,9 +291,11 @@ def _anomaly_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "category": row["category"],
         "description": row["description"],
         "reported_by": row["reported_by"],
+        "reporter_id": row["reporter_id"],
         "reported_at": row["reported_at"].isoformat(),
         "status": row["status"],
         "confirmed_by": row["confirmed_by"],
+        "confirmer_id": row["confirmer_id"],
         "confirmed_at": row["confirmed_at"].isoformat()
         if row["confirmed_at"]
         else None,
