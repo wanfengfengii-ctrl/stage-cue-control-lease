@@ -191,6 +191,9 @@ pytest 用 24 线程共享连接池、16 线程各自独立连接池两种方式
 - **另一席**在同一张卡片看到待确认记录后点击「下一班确认已看到」：服务端只
   允许 `pending → confirmed` 这一种转换（`UPDATE ... WHERE status='pending'`
   条件更新），保存**确认席位与确认时间**；16 路并发确认也只有一人写入；
+  **报告席位不能确认自己的报告**——同名（去空格后）确认被服务端以
+  `409 anomaly_self_confirm` 拒绝，界面上报告席只看到「等待下一班确认」、
+  没有确认按钮，确认入口仅对另一席出现；
 - 重复报告返回 `409 anomaly_exists`、重复确认返回 `409 anomaly_confirmed`，
   两者都在错误体 `detail.anomaly` 中**携带当前记录**并附 `detail.state`
   最新快照——失败永远不改写首次数据（后端测试直接核对行内容）；类别无效 /
@@ -233,6 +236,7 @@ pytest 用 24 线程共享连接池、16 线程各自独立连接池两种方式
 （场次名称空白）、`409 no_active_session`（无进行中场次却请求结束）、
 `400 invalid_anomaly`（异常类别无效 / 说明或席位空白）、
 `409 no_execution_event`（尚无执行事件却报告异常）、
+`409 anomaly_self_confirm`（报告席尝试确认自己的报告，仅另一席可确认）、
 `409 anomaly_exists`（重复报告，`detail.anomaly` 携带当前记录）、
 `409 anomaly_not_found`（当前事件没有待确认记录）、
 `409 anomaly_confirmed`（重复确认，携带已确认记录与确认席位）。

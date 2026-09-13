@@ -218,6 +218,13 @@ button.danger { background: var(--danger); border-color: var(--danger); }
 .anomaly-status { font-size: 12px; color: var(--warn); font-weight: 600; }
 .anomaly-record.confirmed .anomaly-status { color: var(--ok); }
 .anomaly-text { margin: 0; font-size: 13px; line-height: 1.5; }
+.anomaly-await {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  border-top: 1px dashed var(--line);
+  padding-top: 6px;
+}
 .anomaly-meta {
   display: flex;
   flex-wrap: wrap;

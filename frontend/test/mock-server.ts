@@ -361,6 +361,15 @@ export class MockServer {
     if (!record) {
       return err(409, "anomaly_not_found", "当前执行事件没有待确认的异常记录");
     }
+    // Only ANOTHER seat (the next shift) may acknowledge the report.
+    if (record.reported_by === confirmer) {
+      return err(
+        409,
+        "anomaly_self_confirm",
+        "报告席位不能自行确认，请由下一班（另一席）确认已看到",
+        record,
+      );
+    }
     if (record.status !== "pending") {
       return err(409, "anomaly_confirmed", "该异常记录已确认，请勿重复确认", record);
     }

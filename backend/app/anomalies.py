@@ -8,9 +8,11 @@ have actually seen it — replacing untraceable verbal handovers.
     action_anomalies row in status 'pending' (待确认); the report carries a
     category, a description, the reporting seat and a server-side UTC time.
 
-  confirm（确认）: another seat moves the record — and only such a record —
-    from 'pending' to 'confirmed' (已确认); the server stamps the confirming
-    seat and time.  The transition is conditional (UPDATE ... WHERE
+  confirm（确认）: ANOTHER seat moves the record — and only such a record —
+    from 'pending' to 'confirmed' (已确认); the reporting seat can never
+    confirm its own report (409 anomaly_self_confirm), so the acknowledgement
+    can only come from the next shift. The server stamps the confirming seat
+    and time.  The transition is conditional (UPDATE ... WHERE
     status='pending'), so even racing confirms admit exactly one winner.
 
 Both operations row-lock the action first (the same FOR UPDATE lock that
@@ -45,6 +47,8 @@ CATEGORIES: dict[str, str] = {
 #   no_execution_event 409 — no executed event exists to report on yet
 #   anomaly_exists    409 — repeat report on the same event
 #   anomaly_not_found 409 — confirm requested with no pending record on the event
+#   anomaly_self_confirm 409 — the reporting seat tries to confirm its own
+#                        report; only ANOTHER seat (the next shift) may
 #   anomaly_confirmed 409 — repeat confirmation; the record is already confirmed
 
 
@@ -208,6 +212,17 @@ def confirm(action_id: str, confirmer: str) -> dict[str, Any]:
                     "anomaly_not_found",
                     "当前执行事件没有待确认的异常记录",
                     409,
+                )
+            # Only ANOTHER seat — the next shift — may acknowledge the
+            # report. The reporting seat confirming its own anomaly would
+            # defeat the handover trace, so the server rejects it even if the
+            # console mistakenly offers the button.
+            if record["reported_by"] == confirmer:
+                raise AnomalyError(
+                    "anomaly_self_confirm",
+                    "报告席位不能自行确认，请由下一班（另一席）确认已看到",
+                    409,
+                    anomaly=_anomaly_from_row(record),
                 )
             if record["status"] != "pending":
                 raise AnomalyError(

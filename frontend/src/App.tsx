@@ -709,6 +709,9 @@ function AnomalyPanel({ state, seat, onChanged }: AnomalyPanelProps) {
       if (err.code === "anomaly_confirmed" || err.code === "anomaly_not_found") {
         onChanged();
       } else {
+        // anomaly_self_confirm (the server never lets a seat confirm its
+        // own report) and any other rejection: show it in place, keep the
+        // record untouched.
         setFormError(err.message);
       }
     } finally {
@@ -815,15 +818,23 @@ function AnomalyPanel({ state, seat, onChanged }: AnomalyPanelProps) {
             </span>
           </div>
           {record.status === "pending" ? (
-            <button
-              type="button"
-              className="primary"
-              data-testid="btn-anomaly-confirm"
-              disabled={confirming}
-              onClick={confirmRecord}
-            >
-              下一班确认已看到
-            </button>
+            record.reported_by === seat.trim() ? (
+              // The reporting seat can never acknowledge its own report:
+              // only the next shift (another seat) may confirm it.
+              <p className="anomaly-await" data-testid="anomaly-await-confirm">
+                已留痕，等待下一班（另一席）确认已看到
+              </p>
+            ) : (
+              <button
+                type="button"
+                className="primary"
+                data-testid="btn-anomaly-confirm"
+                disabled={confirming}
+                onClick={confirmRecord}
+              >
+                下一班确认已看到
+              </button>
+            )
           ) : (
             <div className="anomaly-meta" data-testid="anomaly-confirmation">
               <span data-testid="anomaly-confirmer">

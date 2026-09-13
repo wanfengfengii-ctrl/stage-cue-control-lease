@@ -179,6 +179,48 @@ def test_confirm_pending_record_stamps_seat_and_time(services):
     assert state["anomaly"]["confirmed_by"] == "下一班-B"
 
 
+def test_reporting_seat_cannot_confirm_its_own_report(services, db_pool):
+    """The handover acknowledgement must come from ANOTHER seat."""
+    _execute_once(services, LIFT)
+    anomalies.report(LIFT, "equipment", "异响", "升降台席")
+
+    # Exact same seat name — rejected, record stays pending and unstamped.
+    with pytest.raises(anomalies.AnomalyError) as ei:
+        anomalies.confirm(LIFT, "升降台席")
+    exc = ei.value
+    assert exc.status == 409
+    assert exc.code == "anomaly_self_confirm"
+    # The current pending record rides along with the business error.
+    assert exc.anomaly["status"] == "pending"
+    assert exc.anomaly["reported_by"] == "升降台席"
+    assert exc.anomaly["confirmed_by"] is None
+
+    # Surrounding spaces are trimmed, so a disguised repeat is rejected too.
+    with pytest.raises(anomalies.AnomalyError) as ei:
+        anomalies.confirm(LIFT, "  升降台席 ")
+    assert ei.value.code == "anomaly_self_confirm"
+
+    rows = _anomaly_rows(db_pool, LIFT)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "pending"
+    assert rows[0]["confirmed_by"] is None
+    assert rows[0]["confirmed_at"] is None
+
+    # ANOTHER seat can still confirm it afterwards.
+    out = anomalies.confirm(LIFT, "下一班-B")
+    assert out["anomaly"]["status"] == "confirmed"
+    assert out["anomaly"]["confirmed_by"] == "下一班-B"
+
+
+def test_different_seat_name_is_another_seat_and_may_confirm(services):
+    """Seat names are compared literally after trimming (no case folding)."""
+    _execute_once(services, LIFT)
+    anomalies.report(LIFT, "equipment", "异响", "Seat-A")
+    # A genuinely different seat string is a different seat and allowed.
+    out = anomalies.confirm(LIFT, "seat-a")
+    assert out["anomaly"]["confirmed_by"] == "seat-a"
+
+
 def test_confirm_without_record_is_409(services, db_pool):
     _execute_once(services, LIFT)
     with pytest.raises(anomalies.AnomalyError) as ei:
@@ -398,6 +440,39 @@ def test_http_blank_description_inline_error(client):
     detail = r.json()["detail"]
     assert detail["code"] == "invalid_anomaly"
     assert "说明" in detail["message"]
+
+
+def test_http_self_confirm_rejected_and_other_seat_succeeds(client):
+    token = client.post(
+        f"/api/actions/{LIFT}/lease", json={"holder": "报告席-A"}
+    ).json()["token"]
+    client.post(f"/api/actions/{LIFT}/execute", json={"token": token})
+    client.post(
+        f"/api/actions/{LIFT}/anomaly",
+        json={"category": "equipment", "description": "异响", "reporter": "报告席-A"},
+    )
+
+    # The reporting seat cannot acknowledge its own report.
+    r = client.post(
+        f"/api/actions/{LIFT}/anomaly/confirm",
+        json={"confirmer": "报告席-A"},
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "anomaly_self_confirm"
+    assert detail["anomaly"]["status"] == "pending"
+    assert detail["anomaly"]["confirmed_by"] is None
+    assert detail["state"]["action_id"] == LIFT
+
+    # The record is untouched and another seat's confirm still works.
+    state = client.get(f"/api/actions/{LIFT}").json()
+    assert state["anomaly"]["status"] == "pending"
+    r = client.post(
+        f"/api/actions/{LIFT}/anomaly/confirm",
+        json={"confirmer": "下一班-B"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["anomaly"]["confirmed_by"] == "下一班-B"
 
 
 def test_http_repeat_report_and_confirm_carry_current_record(client):

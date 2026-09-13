@@ -97,9 +97,13 @@ describe("App anomaly report (现场异常) on the latest execution event", () =
     expect(within(record).getByTestId("anomaly-reported-at")).toHaveTextContent(
       /报告时间：\d{2}:\d{2}:\d{2}/,
     );
-    // The report entry is gone while a record exists.
+    // The report entry is gone while a record exists, and the reporter
+    // themselves gets only the "awaiting the next shift" hint.
     expect(within(panel()).queryByTestId("btn-anomaly-open")).toBeNull();
-    expect(within(record).getByTestId("btn-anomaly-confirm")).toBeEnabled();
+    expect(within(record).queryByTestId("btn-anomaly-confirm")).toBeNull();
+    expect(
+      within(record).getByTestId("anomaly-await-confirm"),
+    ).toBeInTheDocument();
 
     // Exactly one record, on the latest event.
     const eventId = server.lastEventIds[ACTION]!;
@@ -156,11 +160,24 @@ describe("App anomaly report (现场异常) on the latest execution event", () =
       "待确认",
     );
 
+    // The reporting seat itself must NOT be offered a confirm button: only
+    // another seat (the next shift) may acknowledge the report.
+    expect(within(record).queryByTestId("btn-anomaly-confirm")).toBeNull();
+    expect(
+      within(record).getByTestId("anomaly-await-confirm"),
+    ).toBeInTheDocument();
+
     // The other shift opens the same console (seat name is per browser
     // session) and acknowledges the record.
     fireEvent.change(screen.getByLabelText("本席名称"), {
       target: { value: "下一班-B" },
     });
+    await waitFor(() =>
+      expect(
+        within(panel()).getByTestId("btn-anomaly-confirm"),
+      ).toBeInTheDocument(),
+    );
+    expect(within(panel()).queryByTestId("anomaly-await-confirm")).toBeNull();
     fireEvent.click(within(record).getByTestId("btn-anomaly-confirm"));
 
     await waitFor(() =>
@@ -199,7 +216,14 @@ describe("App anomaly report (现场异常) on the latest execution event", () =
     );
     fireEvent.click(within(panel()).getByTestId("btn-anomaly-submit"));
     await within(panel()).findByTestId("anomaly-record");
-    fireEvent.click(within(panel()).getByTestId("btn-anomaly-confirm"));
+
+    // The reporter cannot self-confirm; the next shift acknowledges it.
+    fireEvent.change(screen.getByLabelText("本席名称"), {
+      target: { value: "下一班-B" },
+    });
+    fireEvent.click(
+      await within(panel()).findByTestId("btn-anomaly-confirm"),
+    );
     await waitFor(() =>
       expect(within(panel()).getByTestId("anomaly-status")).toHaveTextContent(
         "已确认",

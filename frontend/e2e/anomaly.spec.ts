@@ -53,7 +53,23 @@ test("one seat reports an anomaly; the other seat confirms; result survives refr
   );
   await expect(panelA.getByTestId("anomaly-reporter")).toContainText("异常报告席-A");
   await expect(panelA.getByTestId("anomaly-reported-at")).toContainText("报告时间：");
-  await expect(panelA.getByTestId("btn-anomaly-confirm")).toBeVisible();
+
+  // The reporting seat itself cannot acknowledge its own report — the
+  // server only accepts confirmation from ANOTHER seat.
+  await expect(panelA.getByTestId("btn-anomaly-confirm")).toHaveCount(0);
+  await expect(panelA.getByTestId("anomaly-await-confirm")).toBeVisible();
+
+  // Even a direct request from the reporting seat is rejected by the
+  // server and leaves the record pending and unstamped.
+  const selfConfirm = await a.page.request.post(
+    `/api/actions/${ACTION}/anomaly/confirm`,
+    { data: { confirmer: "异常报告席-A" } },
+  );
+  expect(selfConfirm.status()).toBe(409);
+  const selfDetail = (await selfConfirm.json()).detail;
+  expect(selfDetail.code).toBe("anomaly_self_confirm");
+  expect(selfDetail.anomaly.status).toBe("pending");
+  expect(selfDetail.anomaly.confirmed_by).toBeNull();
 
   // ---- Seat B: second browser sees the pending record --------------------
   const b = await openSeat(browser, "接班确认席-B");
