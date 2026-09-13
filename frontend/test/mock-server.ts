@@ -1,9 +1,12 @@
-import type { ActionState } from "../src/api";
+import type { ActionState, SessionSummary } from "../src/api";
 
 /**
  * In-memory test double that mirrors the FastAPI lease rules:
  * one live lease per action, 30 s TTL judged by the *server* clock,
  * token hashes compared, expired/replaced tokens rejected with control_lost.
+ * Sessions mirror the rehearsal-round rules: at most one active session,
+ * events tagged with the session active at execution time, ended summaries
+ * frozen but still queryable.
  *
  * It only exists for jsdom component tests; the shipped app and Playwright
  * suites talk to the real FastAPI + PostgreSQL service.
@@ -39,6 +42,13 @@ interface Lease {
   executed: boolean;
 }
 
+interface SessionRec {
+  id: number;
+  name: string;
+  startedAt: number;
+  endedAt: number | null;
+}
+
 export class MockServer {
   leases: Record<string, Lease> = {};
   serverNow = 1_700_000_000_000;
@@ -48,6 +58,38 @@ export class MockServer {
   lastExecutedBy: Record<string, string> = {};
   /** action_id -> link id of the most recent linked execution. */
   links: Record<string, string> = {};
+  sessions: SessionRec[] = [];
+  /** Every executed event with the session it was attributed to (if any). */
+  eventLog: { action_id: string; session_id: number | null }[] = [];
+  private nextSessionId = 1;
+
+  private activeSession(): SessionRec | undefined {
+    return this.sessions.find((s) => s.endedAt === null);
+  }
+
+  private recordEvent(actionId: string) {
+    this.events[actionId] = (this.events[actionId] ?? 0) + 1;
+    this.eventLog.push({
+      action_id: actionId,
+      session_id: this.activeSession()?.id ?? null,
+    });
+  }
+
+  /** Active session, else the most recently ended one (frozen summary). */
+  sessionSummary(): SessionSummary | null {
+    const s = this.activeSession() ?? this.sessions[this.sessions.length - 1];
+    if (!s) return null;
+    const evts = this.eventLog.filter((e) => e.session_id === s.id);
+    return {
+      id: s.id,
+      name: s.name,
+      status: s.endedAt === null ? "active" : "ended",
+      started_at: new Date(s.startedAt).toISOString(),
+      ended_at: s.endedAt ? new Date(s.endedAt).toISOString() : null,
+      event_count: evts.length,
+      action_count: new Set(evts.map((e) => e.action_id)).size,
+    };
+  }
 
   /** Move the server clock past every outstanding lease. */
   elapse30s() {
@@ -84,12 +126,13 @@ export class MockServer {
     };
   }
 
-  private all(): { server_time: string; ttl_seconds: number; poll_interval_ms: number; actions: ActionState[] } {
+  private all(): { server_time: string; ttl_seconds: number; poll_interval_ms: number; actions: ActionState[]; session: SessionSummary | null } {
     return {
       server_time: new Date(this.serverNow).toISOString(),
       ttl_seconds: 30,
       poll_interval_ms: 1000,
       actions: ACTION_IDS.map((id) => this.state(id)),
+      session: this.sessionSummary(),
     };
   }
 
@@ -183,7 +226,7 @@ export class MockServer {
     const events = items.map((it) => {
       const live = this.live(it.action_id)!;
       live.executed = true;
-      this.events[it.action_id] = (this.events[it.action_id] ?? 0) + 1;
+      this.recordEvent(it.action_id);
       this.lastExecutedBy[it.action_id] = live.holder;
       this.links[it.action_id] = linkId;
       return {
@@ -199,6 +242,36 @@ export class MockServer {
     };
   }
 
+  /** Mirrors POST /api/sessions/transition: start or end the round. */
+  private handleSessionTransition(payload: any) {
+    const op = (payload.op ?? "").trim();
+    const err = (status: number, code: string, message: string) => ({
+      status,
+      body: { detail: { code, message, session: this.sessionSummary() } },
+    });
+    if (op === "start") {
+      const name = (payload.name ?? "").trim();
+      if (!name) return err(400, "invalid_name", "场次名称不能为空");
+      if (this.activeSession()) {
+        return err(409, "session_active", "已有进行中的场次，请先结束当前场次");
+      }
+      this.sessions.push({
+        id: this.nextSessionId++,
+        name,
+        startedAt: this.serverNow,
+        endedAt: null,
+      });
+      return { status: 200, body: this.sessionSummary() };
+    }
+    if (op === "end") {
+      const active = this.activeSession();
+      if (!active) return err(409, "no_active_session", "当前没有进行中的场次");
+      active.endedAt = this.serverNow;
+      return { status: 200, body: this.sessionSummary() };
+    }
+    return err(400, "invalid_request", "未知的场次操作（仅支持 start / end）");
+  }
+
   /** Entry point used by the mocked global fetch. */
   handle(url: string, init?: { method?: string; body?: string }) {
     const method = init?.method ?? "GET";
@@ -206,6 +279,13 @@ export class MockServer {
 
     if (url.endsWith("/api/actions") && method === "GET") {
       return { status: 200, body: this.all() };
+    }
+
+    if (url.endsWith("/api/sessions/transition") && method === "POST") {
+      return this.handleSessionTransition(payload);
+    }
+    if (url.endsWith("/api/sessions/current") && method === "GET") {
+      return { status: 200, body: { session: this.sessionSummary() } };
     }
 
     // Linked execution must be matched before the single-action regex,
@@ -279,7 +359,7 @@ export class MockServer {
       }
       // execute: exactly one event
       live.executed = true;
-      this.events[id] = (this.events[id] ?? 0) + 1;
+      this.recordEvent(id);
       this.lastExecutedBy[id] = live.holder;
       return {
         status: 200,

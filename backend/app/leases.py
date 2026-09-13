@@ -212,13 +212,17 @@ def execute(action_id: str, token: str) -> dict[str, Any]:
                     "UPDATE leases SET executed_at = %s WHERE id = %s",
                     (now, lease["id"]),
                 )
+                # Attribute the event to the active rehearsal session (if
+                # any) inside the same transaction.
+                session_id = db.active_session_id(conn)
                 # Unique index on lease_id makes double-write impossible even
                 # at the SQL level.
                 event = conn.execute(
                     """
                     INSERT INTO action_events
-                        (action_id, lease_id, token_hash, holder, result)
-                    VALUES (%s, %s, %s, %s, %s)
+                        (action_id, lease_id, token_hash, holder, result,
+                         session_id)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING id, occurred_at
                     """,
                     (
@@ -227,6 +231,7 @@ def execute(action_id: str, token: str) -> dict[str, Any]:
                         lease["token_hash"],
                         lease["holder"],
                         "executed",
+                        session_id,
                     ),
                 ).fetchone()
                 state = db.state_for(conn, action_id, now)
@@ -315,6 +320,9 @@ def execute_linked(items: list[dict[str, str]]) -> dict[str, Any]:
                     # and rolls back the whole transaction.
                     held[aid] = _authenticate_live(conn, aid, tokens[aid], now)
                 events = []
+                # Both events of the linked run belong to the rehearsal
+                # session active right now (same transaction), if any.
+                session_id = db.active_session_id(conn)
                 for aid in ordered:
                     lease = held[aid]
                     conn.execute(
@@ -325,8 +333,8 @@ def execute_linked(items: list[dict[str, str]]) -> dict[str, Any]:
                         """
                         INSERT INTO action_events
                             (action_id, lease_id, token_hash, holder, result,
-                             link_id)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                             link_id, session_id)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         RETURNING id, occurred_at
                         """,
                         (
@@ -336,6 +344,7 @@ def execute_linked(items: list[dict[str, str]]) -> dict[str, Any]:
                             lease["holder"],
                             "executed",
                             link_id,
+                            session_id,
                         ),
                     ).fetchone()
                     events.append(

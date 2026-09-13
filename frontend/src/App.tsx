@@ -36,6 +36,9 @@ export default function App() {
   const [notices, setNotices] = useState<Record<string, Notice>>({});
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [linkedBusy, setLinkedBusy] = useState(false);
+  const [sessionName, setSessionName] = useState("");
+  const [sessionBusy, setSessionBusy] = useState(false);
+  const [sessionNotice, setSessionNotice] = useState<Notice | null>(null);
   const [tick, setTick] = useState(0);
   const fetchStartRef = useRef<number>(Date.now());
   const seatRef = useRef(seat);
@@ -203,6 +206,7 @@ export default function App() {
   };
 
   const actions = snapshot?.actions ?? [];
+  const session = snapshot?.session ?? null;
   const nowMs = Date.now();
   const fetchStartMs = fetchStartRef.current;
   void tick; // re-render each second
@@ -278,6 +282,31 @@ export default function App() {
     }
   };
 
+  // Session control: the rehearsal lead starts/ends the named round. The
+  // server alone decides validity — a duplicate start, a blank name, or
+  // ending with no active round comes back as a recognisable business error
+  // and changes nothing; the notice surfaces it verbatim.
+  const onSessionTransition = async (op: "start" | "end") => {
+    setSessionBusy(true);
+    try {
+      const out = await api.sessionTransition(op, sessionName);
+      setSessionNotice({
+        kind: "success",
+        text:
+          op === "start"
+            ? `场次「${out.name}」已开始，此后的动作事件将计入本轮。`
+            : `场次「${out.name}」已结束：本轮共 ${out.event_count} 个事件、涉及 ${out.action_count} 个动作，摘要保持可查。`,
+      });
+      if (op === "start") setSessionName("");
+    } catch (e) {
+      const err = e as ApiError;
+      setSessionNotice({ kind: "error", text: err.message });
+    } finally {
+      setSessionBusy(false);
+      void refresh();
+    }
+  };
+
   const rows = useMemo(
     () =>
       actions.map((state) => (
@@ -325,6 +354,64 @@ export default function App() {
         <p className="please">请填写本席名称以查看动作状态。</p>
       ) : (
         <>
+          <section className="session-bar" data-testid="session-bar">
+            <div className="session-controls">
+              <label htmlFor="session-name">场次</label>
+              <input
+                id="session-name"
+                data-testid="session-name"
+                value={sessionName}
+                placeholder="场次名称，如：第一轮联排"
+                onChange={(e) => setSessionName(e.target.value)}
+                maxLength={64}
+              />
+              <button
+                type="button"
+                className="primary"
+                data-testid="btn-session-start"
+                disabled={sessionBusy}
+                onClick={() => onSessionTransition("start")}
+              >
+                开始场次
+              </button>
+              <button
+                type="button"
+                data-testid="btn-session-end"
+                disabled={sessionBusy || session?.status !== "active"}
+                onClick={() => onSessionTransition("end")}
+              >
+                结束场次
+              </button>
+            </div>
+            {session && (
+              <div
+                className={`session-summary ${session.status}`}
+                data-testid="session-summary"
+                data-status={session.status}
+              >
+                <span data-testid="session-summary-name">
+                  场次「{session.name}」
+                </span>
+                <span data-testid="session-summary-status">
+                  {session.status === "active" ? "进行中" : "已结束"}
+                </span>
+                <span data-testid="session-summary-events">
+                  累计事件 {session.event_count} 次
+                </span>
+                <span data-testid="session-summary-actions">
+                  涉及动作 {session.action_count} 个
+                </span>
+              </div>
+            )}
+            {sessionNotice && (
+              <p
+                className={`notice ${sessionNotice.kind}`}
+                data-testid="session-notice"
+              >
+                {sessionNotice.text}
+              </p>
+            )}
+          </section>
           {linkedPair && (
             <section className="linked-bar" data-testid="linked-bar">
               <span className="linked-info">

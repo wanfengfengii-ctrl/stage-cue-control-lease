@@ -59,7 +59,41 @@ CREATE UNIQUE INDEX IF NOT EXISTS action_events_lease_uniq
 
 -- Migration for databases created before linked execution existed.
 ALTER TABLE action_events ADD COLUMN IF NOT EXISTS link_id TEXT;
+
+-- Rehearsal sessions (场次): a named round grouping the action events
+-- executed while it is active.  A session only ever moves
+-- active -> ended; it is never deleted and never reopened.
+CREATE TABLE IF NOT EXISTS rehearsal_sessions (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name        TEXT NOT NULL,
+    started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at    TIMESTAMPTZ
+);
+-- At most ONE active (not yet ended) session at any instant, enforced at
+-- the SQL level: every active row indexes the same key `true`, so a second
+-- concurrent insert fails with a unique violation.
+CREATE UNIQUE INDEX IF NOT EXISTS rehearsal_sessions_one_active
+    ON rehearsal_sessions ((ended_at IS NULL))
+    WHERE ended_at IS NULL;
+
+-- Migration for databases created before rehearsal sessions existed.
+-- NULL on events executed outside any session (and on all history).
+ALTER TABLE action_events ADD COLUMN IF NOT EXISTS session_id BIGINT
+    REFERENCES rehearsal_sessions(id);
 """
+
+
+def active_session_id(conn: psycopg.Connection) -> int | None:
+    """Id of the currently active (not-ended) rehearsal session, if any.
+
+    Read inside the caller's transaction so an execution and its session
+    attribution always commit — or roll back — together.
+    """
+    row = conn.execute(
+        "SELECT id FROM rehearsal_sessions"
+        " WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return row["id"] if row else None
 
 
 def get_pool() -> ConnectionPool:

@@ -5,9 +5,11 @@
 的控制权交接台：
 
 - **React + TypeScript** 控制台：每个浏览器会话都能看到动作状态（持有席位、
-  剩余秒数、执行结果），并可申请 / 续期 / 释放 / 执行；
+  剩余秒数、执行结果），并可申请 / 续期 / 释放 / 执行；联排负责人还可在
+  控制台**开始 / 结束场次**，把一段现场操作归入明确的一轮；
 - **FastAPI** 服务：授予不可猜测令牌，所有判定只按**服务端 UTC 时间**；
-- **PostgreSQL**：单事务行锁保证同一动作同时只有一个有效租约。
+- **PostgreSQL**：单事务行锁保证同一动作同时只有一个有效租约；部分唯一索引
+  保证任一时刻只有一个进行中场次。
 
 无任何假接口：界面里的每一个按钮都走 HTTP → FastAPI → PostgreSQL。
 （`frontend/test/mock-server.ts` 仅是 jsdom 组件测试的测试替身，不出现在运行栈中；
@@ -50,13 +52,19 @@ docker compose down -v       # 连同 PostgreSQL 数据一并删除
 
 1. pytest：针对同一套 PostgreSQL 验证**数据库事务竞争**（24 路并发争抢仅 1 个
    赢家、独立连接池同样串行化）、**过期边界**（`now == expires_at` 即失效、
-   旧令牌迟到的续期 / 释放 / 执行全部拒绝且新租约不变、执行只写一次事件）与
+   旧令牌迟到的续期 / 释放 / 执行全部拒绝且新租约不变、执行只写一次事件）、
    **联动执行**（两条事件共享联动标识且各计数一次、交换动作顺序结果一致、
-   并发的联动与单动作执行只有一方提交、一枚旧令牌使整次操作无副作用）；
-2. Playwright：两个真实浏览器上下文模拟双控制席——同时争抢只有一人持有、
+   并发的联动与单动作执行只有一方提交、一枚旧令牌使整次操作无副作用）与
+   **场次归属**（单动作与联动事件在原事务内计入当前场次、并发开始仅一个
+   进行中场次、重复开始 / 空白名称 / 无进行中场次时结束均为可识别业务错误
+   且不改动事件、结束后摘要冻结且后续动作不再计入）；
+2. Vitest：倒计时边界、接管 / 旧令牌界面逻辑，以及场次全流程组件测试
+   （开始 → 两类动作执行 → 结束后摘要冻结）；
+3. Playwright：两个真实浏览器上下文模拟双控制席——同时争抢只有一人持有、
    失联满 30 秒后另一席立即接管、旧页面再次点击明确显示「控制权已失效」；
-   另有双动作联动用例：一席持两动作一次联动成功，以及旧令牌联动被 409
-   拒绝且另一租约不受影响。
+   另有双动作联动用例（一席持两动作一次联动成功、旧令牌联动被 409
+   拒绝且另一租约不受影响），以及场次用例（控制台开始场次 → 单动作 +
+   联动各执行一次 → 结束场次 → 摘要固定且随后执行不再计入）。
 
 ```bash
 docker compose --profile verify run --build --rm verify
@@ -138,6 +146,30 @@ pytest 用 24 线程共享连接池、16 线程各自独立连接池两种方式
   ——不写入任何事件，也不终结另一个仍然有效的租约。页面不清除任何令牌，两张
   卡片保持真实控制状态，失效卡片提示重新取得控制权。
 
+### 场次（一轮联排的归属与摘要）
+
+负责人把一段现场操作归入明确场次，避免动作事件散落后无法判断本轮排练的
+执行范围与结果：
+
+- 控制台提供**场次控制入口**：填写场次名称后「开始场次」，进行中可
+  「结束场次」。两者都走同一个状态转换接口
+  `POST /api/sessions/transition`（body: `{"op":"start","name":…}` 或
+  `{"op":"end"}`）；场次只在 **进行中 → 已结束** 之间单向流转；
+- **任一时刻只有一个进行中场次**：`rehearsal_sessions` 上的部分唯一索引
+  （`WHERE ended_at IS NULL`）在 SQL 层面保证并发开始只有一个赢家，败者
+  收到 `409 session_active`；
+- 单动作执行与双动作联动**成功写入事件时**，在**原事务**内把当前进行中场次
+  的 id 写入 `action_events.session_id`（无进行中场次时保持 `NULL`，历史
+  行为不变）；提交或回滚与事件本身同生共死；
+- 动作轮询响应 `GET /api/actions` 新增 `session` 摘要（场次名称、状态、
+  **累计事件数**、**涉及动作数**），页面持续展示本轮摘要；结束后摘要
+  保持可查（`GET /api/sessions/current` 同样返回），随后执行的动作不再
+  计入该场次——新一轮开始前的摘要数字就此冻结；
+- 错误边界均为可识别业务错误且不改动任何事件：重复开始
+  `409 session_active`、名称空白 `400 invalid_name`、没有进行中场次却
+  请求结束 `409 no_active_session`；错误响应的 `detail.session` 附带当前
+  场次摘要便于界面重渲染。
+
 ### 时间只信服务端
 
 - 到期判定全部使用数据库事务内的 `now()`，客户端不能用本地时钟影响结果；
@@ -148,18 +180,21 @@ pytest 用 24 线程共享连接池、16 线程各自独立连接池两种方式
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/actions` | 全部动作快照（短轮询），含 `last_link_id` |
+| GET | `/api/actions` | 全部动作快照（短轮询），含 `last_link_id` 与 `session` 场次摘要 |
 | GET | `/api/actions/{id}` | 单个动作快照 |
 | POST | `/api/actions/{id}/lease` | 申请（body: `{"holder":"席位名"}`），返回令牌 |
 | POST | `/api/actions/{id}/renew` | 续期 30 秒（body 或 Bearer 携带令牌） |
 | POST | `/api/actions/{id}/release` | 主动释放 |
-| POST | `/api/actions/{id}/execute` | 执行；写且仅写一条动作事件 |
+| POST | `/api/actions/{id}/execute` | 执行；写且仅写一条动作事件（计入当前场次） |
 | POST | `/api/actions/execute-linked` | 联动执行（body: `{"items":[{"action_id","token"},…]}`），全部成功或全部不变 |
+| POST | `/api/sessions/transition` | 场次状态转换（body: `{"op":"start","name":…}` / `{"op":"end"}`） |
+| GET | `/api/sessions/current` | 当前场次摘要（进行中或最近已结束），结束后仍可查 |
 
 失败响应：`409 lease_held`（争抢失败）、`409 control_lost`（旧/错令牌或已
 过期，响应附带最新 `state` 便于界面渲染当前持有者；联动接口以
 `detail.action_id` 指明具体失效动作并附 `states`）、`404`（未知动作）、
-`401`（缺令牌）。
+`401`（缺令牌）、`409 session_active`（重复开始场次）、`400 invalid_name`
+（场次名称空白）、`409 no_active_session`（无进行中场次却请求结束）。
 
 ## 目录结构
 
@@ -167,14 +202,15 @@ pytest 用 24 线程共享连接池、16 线程各自独立连接池两种方式
 backend/            FastAPI + psycopg + PostgreSQL
   app/main.py         HTTP 路由
   app/leases.py       事务化租约逻辑（FOR UPDATE / 令牌 / 一次性事件）
+  app/sessions.py     场次状态转换与摘要（开始 / 结束 / 当前场次）
   app/db.py           连接池、建表、状态快照
-  tests/              pytest：事务竞争、过期边界、HTTP 端到端
+  tests/              pytest：事务竞争、过期边界、HTTP 端到端、场次归属
 frontend/           React + Vite + TypeScript
   src/api.ts          类型化 HTTP 客户端（真实接口）
   src/lease.ts        服务端时钟锚定的倒计时（纯函数，单测覆盖边界）
-  src/App.tsx         短轮询控制台
+  src/App.tsx         短轮询控制台（含场次控制入口与本轮摘要）
   test/               Vitest 单元 + 组件测试（mock 仅存在于测试目录）
-  e2e/                Playwright 双浏览器交接用例（真实服务）
+  e2e/                Playwright 双浏览器交接 + 联动 + 场次用例（真实服务）
 verify/             一次性验收服务的镜像构建与执行脚本
 docker-compose.yml  db / api / web / verify
 ```

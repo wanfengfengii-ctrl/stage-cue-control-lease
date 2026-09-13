@@ -21,6 +21,20 @@ export interface ActionsSnapshot {
   ttl_seconds: number;
   poll_interval_ms: number;
   actions: ActionState[];
+  /** Active rehearsal session, or the frozen summary of the last ended one. */
+  session: SessionSummary | null;
+}
+
+export interface SessionSummary {
+  id: number;
+  name: string;
+  status: "active" | "ended";
+  started_at: string;
+  ended_at: string | null;
+  /** Cumulative action events attributed to this round. */
+  event_count: number;
+  /** Distinct actions involved in this round. */
+  action_count: number;
 }
 
 export interface LeaseGrant {
@@ -40,6 +54,8 @@ export interface ApiError extends Error {
   action_id: string | null;
   /** Linked execution: fresh snapshots of every involved action. */
   states: Record<string, ActionState> | null;
+  /** Session transition errors: the current session summary, if any. */
+  session: SessionSummary | null;
 }
 
 function makeError(status: number, body: any): ApiError {
@@ -55,6 +71,7 @@ function makeError(status: number, body: any): ApiError {
   err.state = detail?.state ?? null;
   err.action_id = detail?.action_id ?? null;
   err.states = detail?.states ?? null;
+  err.session = detail?.session ?? null;
   return err;
 }
 
@@ -119,4 +136,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ items }),
     }),
+
+  sessionTransition: (op: "start" | "end", name = "") =>
+    request<SessionSummary>("/api/sessions/transition", {
+      method: "POST",
+      body: JSON.stringify({ op, name }),
+    }),
+
+  currentSession: () =>
+    request<{ session: SessionSummary | null }>("/api/sessions/current"),
 };

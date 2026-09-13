@@ -51,6 +51,47 @@ header h1 { margin: 0 0 4px; font-size: 26px; }
 .hint { color: var(--muted); font-size: 12px; }
 .please { color: var(--muted); }
 
+.session-bar {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin-bottom: 14px;
+}
+.session-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.session-controls input {
+  flex: 1;
+  min-width: 200px;
+  max-width: 320px;
+  background: #0d1320;
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 14px;
+}
+.session-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.session-summary.active [data-testid="session-summary-status"] {
+  color: var(--ok);
+}
+.session-summary.ended [data-testid="session-summary-status"] {
+  color: var(--warn);
+}
+.session-bar .notice { margin: 10px 0 0; }
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));

@@ -7,7 +7,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import config, db, leases
+from . import config, db, leases, sessions
 
 app = FastAPI(title="舞台联排控制权交接台", version="1.0.0")
 
@@ -42,6 +42,13 @@ class LinkedExecuteBody(BaseModel):
     )
 
 
+class SessionTransitionBody(BaseModel):
+    op: str = Field(..., description="场次状态转换：start 开始 / end 结束")
+    # Defaults to "" so a missing name is judged uniformly by the service
+    # (400 invalid_name) instead of a schema-level 422.
+    name: str = Field(default="", description="场次名称（start 时必填）")
+
+
 @app.on_event("startup")
 def _startup() -> None:
     db.init_db()
@@ -54,13 +61,44 @@ def health():
 
 @app.get("/api/actions")
 def get_actions():
-    """Snapshot of every action for short polling by all browser sessions."""
+    """Snapshot of every action for short polling by all browser sessions.
+
+    Also carries the current rehearsal-session summary (name, cumulative
+    event count, distinct action count) so every console continuously shows
+    the round in progress — or the frozen result of the last ended one.
+    """
     return {
         "server_time": _iso_now(),
         "ttl_seconds": config.LEASE_TTL_SECONDS,
         "poll_interval_ms": config.POLL_INTERVAL_MS,
         "actions": leases.list_states(),
+        "session": sessions.current_summary(),
     }
+
+
+@app.post("/api/sessions/transition")
+def session_transition(body: SessionTransitionBody):
+    """The single session state-transition entry: start or end the round.
+
+    Failures are recognisable business errors (duplicate start, blank name,
+    no active session) that write nothing and touch no event; the current
+    summary rides along so the console can re-render.
+    """
+    try:
+        return sessions.transition(body.op, body.name)
+    except leases.LeaseError as exc:
+        raise HTTPException(status_code=exc.status, detail={
+            "code": exc.code,
+            "message": exc.message,
+            "session": sessions.current_summary(),
+        })
+
+
+@app.get("/api/sessions/current")
+def get_current_session():
+    """The active session's summary, or the frozen summary of the last ended
+    one — still queryable after the round is over."""
+    return {"session": sessions.current_summary()}
 
 
 @app.get("/api/actions/{action_id}")
