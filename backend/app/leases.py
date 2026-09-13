@@ -245,9 +245,13 @@ def execute(action_id: str, token: str) -> dict[str, Any]:
 
 
 def execute_linked(items: list[dict[str, str]]) -> dict[str, Any]:
-    """Execute several held actions as ONE atomic linked operation.
+    """Execute two held cross-device actions as ONE atomic linked operation.
 
-    Either every action commits (lease terminated + one event each, all
+    Exactly two actions participate — one lifting-platform action and one
+    flying-hoist action; same-device direction pairs and any other count are
+    rejected with 400 before any lock is taken.
+
+    Either both actions commit (lease terminated + one event each, all
     sharing a server-generated link id) or — if any token is missing,
     expired, or superseded — the transaction rolls back: no event is
     written and no other lease is touched.
@@ -262,9 +266,11 @@ def execute_linked(items: list[dict[str, str]]) -> dict[str, Any]:
          "token": it.get("token") or ""}
         for it in items
     ]
-    if len(parsed) < 2:
+    # A linked run is EXACTLY one lifting-platform action + one flying-hoist
+    # action: the two devices move as a single coordinated cue.
+    if len(parsed) != 2:
         raise LeaseError(
-            "invalid_request", "联动执行至少需要两个动作", 400
+            "invalid_request", "联动执行必须恰好包含两个动作", 400
         )
     action_ids = [it["action_id"] for it in parsed]
     if len(set(action_ids)) != len(action_ids):
@@ -275,6 +281,16 @@ def execute_linked(items: list[dict[str, str]]) -> dict[str, Any]:
     for aid in action_ids:
         if aid not in config.ACTION_IDS:
             raise LeaseError("unknown_action", "未知动作", 404, action_id=aid)
+    devices = {aid: config.DEVICE_OF.get(aid) for aid in action_ids}
+    if any(dev is None for dev in devices.values()) or frozenset(
+        devices.values()
+    ) not in config.LINKABLE_DEVICE_PAIRS:
+        raise LeaseError(
+            "invalid_request",
+            "联动执行只允许升降台与飞行吊点的跨设备组合，"
+            "同一设备的两个方向（如上升与下降）不得联动",
+            400,
+        )
     for it in parsed:
         if not it["token"]:
             raise LeaseError(

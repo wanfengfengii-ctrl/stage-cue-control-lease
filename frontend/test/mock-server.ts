@@ -24,6 +24,13 @@ const LABELS: Record<string, string> = {
   emergency_stop: "紧急停止（联排）",
 };
 
+const DEVICE_OF: Record<string, string> = {
+  lift_up: "lift",
+  lift_down: "lift",
+  hoist_fly_in: "hoist",
+  hoist_fly_out: "hoist",
+};
+
 interface Lease {
   token: string;
   holder: string;
@@ -37,6 +44,8 @@ export class MockServer {
   serverNow = 1_700_000_000_000;
   ttl = 30_000;
   events: Record<string, number> = {};
+  /** action_id -> holder of the most recent execution event. */
+  lastExecutedBy: Record<string, string> = {};
   /** action_id -> link id of the most recent linked execution. */
   links: Record<string, string> = {};
 
@@ -68,8 +77,7 @@ export class MockServer {
       remaining_seconds: l
         ? Math.max(0, Math.ceil((l.expiresAt - this.serverNow) / 1000))
         : 0,
-      last_executed_by:
-        this.leases[id]?.executed ? this.leases[id].holder : null,
+      last_executed_by: this.lastExecutedBy[id] ?? null,
       event_count: this.events[id] ?? 0,
       last_link_id: this.links[id] ?? null,
       server_time: new Date(this.serverNow).toISOString(),
@@ -101,10 +109,10 @@ export class MockServer {
   /** Mirrors POST /api/actions/execute-linked: all commit or none does. */
   private handleLinked(payload: any) {
     const items: { action_id: string; token?: string }[] = payload.items ?? [];
-    if (items.length < 2) {
+    if (items.length !== 2) {
       return {
         status: 400,
-        body: { detail: { code: "invalid_request", message: "联动执行至少需要两个动作" } },
+        body: { detail: { code: "invalid_request", message: "联动执行必须恰好包含两个动作" } },
       };
     }
     const ids = items.map((it) => it.action_id);
@@ -121,6 +129,23 @@ export class MockServer {
           body: { detail: { code: "unknown_action", message: "未知动作", action_id: id } },
         };
       }
+    }
+    // Exactly one platform action + one hoist action: cross-device only.
+    const devices = ids.map((id) => DEVICE_OF[id]);
+    if (
+      devices.some((d) => d === undefined) ||
+      new Set(devices).size !== 2
+    ) {
+      return {
+        status: 400,
+        body: {
+          detail: {
+            code: "invalid_request",
+            message:
+              "联动执行只允许升降台与飞行吊点的跨设备组合，同一设备的两个方向（如上升与下降）不得联动",
+          },
+        },
+      };
     }
     // Validate EVERY token first; any failure aborts the whole run.
     for (const it of items) {
@@ -159,6 +184,7 @@ export class MockServer {
       const live = this.live(it.action_id)!;
       live.executed = true;
       this.events[it.action_id] = (this.events[it.action_id] ?? 0) + 1;
+      this.lastExecutedBy[it.action_id] = live.holder;
       this.links[it.action_id] = linkId;
       return {
         action_id: it.action_id,
@@ -201,9 +227,10 @@ export class MockServer {
         return this.err("lease_held", `该动作已由 ${this.live(id)!.holder} 持有`, id);
       }
       const token = `tok-${Math.random().toString(36).slice(2)}-${id}`;
+      const holder = (payload.holder ?? "").trim();
       const lease: Lease = {
         token,
-        holder: payload.holder,
+        holder,
         expiresAt: this.serverNow + this.ttl,
         released: false,
         executed: false,
@@ -213,7 +240,7 @@ export class MockServer {
         status: 200,
         body: {
           token,
-          holder: payload.holder,
+          holder,
           acquired_at: new Date(this.serverNow).toISOString(),
           expires_at: new Date(lease.expiresAt).toISOString(),
           ttl_seconds: 30,
@@ -253,6 +280,7 @@ export class MockServer {
       // execute: exactly one event
       live.executed = true;
       this.events[id] = (this.events[id] ?? 0) + 1;
+      this.lastExecutedBy[id] = live.holder;
       return {
         status: 200,
         body: {

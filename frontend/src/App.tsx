@@ -5,6 +5,18 @@ import { detectTakeover, formatClock, remainingSeconds } from "./lease";
 const TOKEN_KEY = "handover.tokens.v1";
 const SEAT_KEY = "handover.seat.v1";
 
+// Device each action physically belongs to. A linked cue coordinates the
+// lifting platform WITH the flying hoist, so a valid linked pair is exactly
+// two held actions on two different devices. Two directions of one device
+// (lift_up + lift_down) are mutually exclusive and never linkable; the
+// emergency stop never participates.
+const DEVICE_OF: Record<string, string> = {
+  lift_up: "lift",
+  lift_down: "lift",
+  hoist_fly_in: "hoist",
+  hoist_fly_out: "hoist",
+};
+
 type Notice = { kind: "success" | "error" | "info"; text: string };
 
 function loadTokens(): Record<string, string> {
@@ -195,17 +207,32 @@ export default function App() {
   const fetchStartMs = fetchStartRef.current;
   void tick; // re-render each second
 
+  // The server trims seat names on acquisition, so every holder comparison
+  // uses the trimmed local name: " 联排控制席 " must behave exactly like
+  // "联排控制席".
+  const mySeat = seat.trim();
+
   // Actions this seat currently controls (valid lease + token in session).
   const myHeld = actions.filter(
-    (s) => tokens[s.action_id] && s.holder === seat && s.status === "held",
+    (s) => tokens[s.action_id] && s.holder === mySeat && s.status === "held",
   );
   const labelOf = (actionId: string) =>
     actions.find((a) => a.action_id === actionId)?.label ?? actionId;
 
-  // Linked execution: submit every held action as ONE atomic operation.
+  // The linked cue is EXACTLY one lifting-platform action plus one
+  // flying-hoist action. Holding three actions, or two directions of the
+  // same device, yields no linked entry point.
+  const linkedPair =
+    myHeld.length === 2 &&
+    myHeld.every((s) => DEVICE_OF[s.action_id] !== undefined) &&
+    new Set(myHeld.map((s) => DEVICE_OF[s.action_id])).size === 2
+      ? myHeld
+      : null;
+
+  // Linked execution: submit the cross-device pair as ONE atomic operation.
   const onExecuteLinked = async () => {
-    const held = myHeld;
-    if (held.length < 2) return;
+    const held = linkedPair;
+    if (!held) return;
     const items = held.map((s) => ({
       action_id: s.action_id,
       token: tokens[s.action_id]!,
@@ -260,7 +287,7 @@ export default function App() {
           nowMs={nowMs}
           fetchStartMs={fetchStartMs}
           ttl={ttl}
-          mySeat={seat}
+          mySeat={mySeat}
           myToken={tokens[state.action_id] ?? null}
           notice={notices[state.action_id]}
           busy={!!busy[state.action_id]}
@@ -298,11 +325,11 @@ export default function App() {
         <p className="please">请填写本席名称以查看动作状态。</p>
       ) : (
         <>
-          {myHeld.length >= 2 && (
+          {linkedPair && (
             <section className="linked-bar" data-testid="linked-bar">
               <span className="linked-info">
-                本席已持有 {myHeld.length} 个动作的控制权（
-                {myHeld.map((s) => s.label).join(" + ")}
+                本席已持有升降台与飞行吊点各一个动作的控制权（
+                {linkedPair.map((s) => s.label).join(" + ")}
                 ），可作为一次联动提交。
               </span>
               <button

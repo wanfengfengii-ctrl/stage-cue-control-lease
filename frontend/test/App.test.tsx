@@ -4,10 +4,15 @@ import App from "../src/App";
 import { MockServer } from "./mock-server";
 
 const ACTION = "lift_up";
+const LIFT_DOWN = "lift_down";
 const LINKED_SECOND = "hoist_fly_in";
 
 function card() {
   return screen.getByTestId(`action-${ACTION}`);
+}
+
+function downCard() {
+  return screen.getByTestId(`action-${LIFT_DOWN}`);
 }
 
 function secondCard() {
@@ -284,5 +289,101 @@ describe("App linked execution (two actions as one atomic submit)", () => {
     );
     expect(within(card()).getByTestId("btn-execute")).toBeInTheDocument();
     expect(screen.queryByTestId("linked-bar")).toBeNull();
+  });
+
+  async function acquireCards(ids: string[]) {
+    for (const id of ids) {
+      fireEvent.click(
+        within(screen.getByTestId(`action-${id}`)).getByTestId("btn-acquire"),
+      );
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId(`action-${id}`)).getByTestId("btn-execute"),
+        ).toBeInTheDocument(),
+      );
+    }
+  }
+
+  it("does not offer linkage for the two lift directions (same device)", async () => {
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("本席名称"), {
+      target: { value: "升降台席" },
+    });
+    await waitFor(() =>
+      expect(within(card()).getByTestId("btn-acquire")).toBeEnabled(),
+    );
+    await acquireCards([ACTION, LIFT_DOWN]);
+
+    // Two directions of the SAME device are mutually exclusive: no link bar.
+    expect(screen.queryByTestId("linked-bar")).toBeNull();
+    // Each card is still recognised as held by this seat.
+    expect(within(card()).getByTestId("btn-execute")).toBeInTheDocument();
+    expect(within(downCard()).getByTestId("btn-execute")).toBeInTheDocument();
+  });
+
+  it("does not offer linkage while holding three actions", async () => {
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("本席名称"), {
+      target: { value: "联排控制席" },
+    });
+    await waitFor(() =>
+      expect(within(card()).getByTestId("btn-acquire")).toBeEnabled(),
+    );
+    await acquireCards([ACTION, LIFT_DOWN, LINKED_SECOND]);
+
+    // Three held actions (even though two form a cross-device pair) yield no
+    // linked entry point: a linked cue is exactly two actions.
+    expect(screen.queryByTestId("linked-bar")).toBeNull();
+  });
+
+  it("trims surrounding spaces in the seat name and still recognises holdings", async () => {
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("本席名称"), {
+      target: { value: "  联排控制席  " },
+    });
+    await waitFor(() =>
+      expect(within(card()).getByTestId("btn-acquire")).toBeEnabled(),
+    );
+    await acquireCards([ACTION, LINKED_SECOND]);
+
+    // Behaves exactly like the trimmed seat: both cards are "mine" and the
+    // cross-device linked bar is offered.
+    expect(within(card()).getByTestId("btn-execute")).toBeInTheDocument();
+    expect(within(secondCard()).getByTestId("btn-execute")).toBeInTheDocument();
+    const bar = await screen.findByTestId("linked-bar");
+    expect(bar).toBeVisible();
+
+    // The server stores the trimmed name.
+    expect(server.leases[ACTION]?.holder).toBe("联排控制席");
+  });
+
+  it("keeps the last linked executing seat visible after re-acquisition", async () => {
+    await acquireBoth();
+    fireEvent.click(
+      within(await screen.findByTestId("linked-bar")).getByTestId(
+        "btn-execute-linked",
+      ),
+    );
+    await waitFor(() =>
+      expect(within(card()).getByTestId("events")).toHaveTextContent(
+        "历史执行：1 次",
+      ),
+    );
+    expect(within(card()).getByTestId("events")).toHaveTextContent(
+      "最后：联排控制席",
+    );
+
+    // Re-acquire one card: history count and last executing seat remain.
+    fireEvent.click(within(card()).getByTestId("btn-acquire"));
+    await waitFor(() =>
+      expect(within(card()).getByTestId("btn-execute")).toBeInTheDocument(),
+    );
+    expect(within(card()).getByTestId("events")).toHaveTextContent(
+      "历史执行：1 次",
+    );
+    expect(within(card()).getByTestId("events")).toHaveTextContent(
+      "最后：联排控制席",
+    );
+    expect(within(card()).getByTestId("last-link")).toBeInTheDocument();
   });
 });

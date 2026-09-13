@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 LIFT = "lift_up"
+LIFT_DOWN = "lift_down"
 HOIST = "hoist_fly_in"
 
 
@@ -314,6 +315,135 @@ def test_invalid_linked_requests(services):
     assert ei.value.action_id == "nope"
 
 
+def test_same_device_direction_pair_is_not_linkable(services, db_pool):
+    """lift_up + lift_down must not form a linked cue.
+
+    The two platform directions are mutually exclusive; linked execution is
+    only for cross-device coordination.
+    """
+    g_up = services.acquire(LIFT, "联排控制席")
+    g_down = services.acquire(LIFT_DOWN, "联排控制席")
+    with pytest.raises(services.LeaseError) as ei:
+        services.execute_linked(
+            [
+                {"action_id": LIFT, "token": g_up["token"]},
+                {"action_id": LIFT_DOWN, "token": g_down["token"]},
+            ]
+        )
+    assert ei.value.code == "invalid_request"
+    assert ei.value.status == 400
+    # Rejected before any write: no events, both leases still live.
+    assert _events(db_pool, LIFT) == []
+    assert _events(db_pool, LIFT_DOWN) == []
+    assert services.get_action_state(LIFT)["status"] == "held"
+    assert services.get_action_state(LIFT_DOWN)["status"] == "held"
+
+    # Both leases still work individually; free the actions for the next leg.
+    assert services.execute(LIFT, g_up["token"])["executed"] is True
+    assert services.execute(LIFT_DOWN, g_down["token"])["executed"] is True
+
+    # Two hoist directions are same-device too and equally non-linkable.
+    g_in = services.acquire(HOIST, "联排控制席")
+    g_out = services.acquire("hoist_fly_out", "联排控制席")
+    with pytest.raises(services.LeaseError) as ei:
+        services.execute_linked(
+            [
+                {"action_id": HOIST, "token": g_in["token"]},
+                {"action_id": "hoist_fly_out", "token": g_out["token"]},
+            ]
+        )
+    assert ei.value.code == "invalid_request"
+    assert services.get_action_state(HOIST)["status"] == "held"
+    assert services.get_action_state("hoist_fly_out")["status"] == "held"
+
+    # A genuine cross-device pair still links: release the two hoist
+    # directions, then take one of each device.
+    services.release(HOIST, g_in["token"])
+    services.release("hoist_fly_out", g_out["token"])
+    g_lift2 = services.acquire(LIFT, "联排控制席")
+    g_hoist2 = services.acquire(HOIST, "联排控制席")
+    out = services.execute_linked(
+        [
+            {"action_id": HOIST, "token": g_hoist2["token"]},
+            {"action_id": LIFT, "token": g_lift2["token"]},
+        ]
+    )
+    assert out["linked"] is True
+    assert {e["action_id"] for e in out["events"]} == {LIFT, HOIST}
+
+
+def test_three_actions_is_not_linkable(services, db_pool):
+    """Holding three actions and submitting all valid tokens executes none."""
+    g_lift = services.acquire(LIFT, "联排控制席")
+    g_down = services.acquire(LIFT_DOWN, "联排控制席")
+    g_hoist = services.acquire(HOIST, "联排控制席")
+    with pytest.raises(services.LeaseError) as ei:
+        services.execute_linked(
+            [
+                {"action_id": LIFT, "token": g_lift["token"]},
+                {"action_id": LIFT_DOWN, "token": g_down["token"]},
+                {"action_id": HOIST, "token": g_hoist["token"]},
+            ]
+        )
+    assert ei.value.code == "invalid_request"
+    assert ei.value.status == 400
+    # No side effects at all: zero events, all three leases still live.
+    for aid in (LIFT, LIFT_DOWN, HOIST):
+        assert _events(db_pool, aid) == []
+        assert services.get_action_state(aid)["status"] == "held"
+
+
+def test_last_executed_by_survives_reacquisition(services, db_pool):
+    """After a linked run, re-acquiring a card keeps the last executor shown.
+
+    The historical count stays and the "most recent executing seat" must
+    remain the seat that ran the linked cue — the snapshot reads it from the
+    latest action event, not from the newest lease row.
+    """
+    g_lift, g_hoist = _acquire_pair(services, holder="联排控制席")
+    out = services.execute_linked(
+        [
+            {"action_id": LIFT, "token": g_lift["token"]},
+            {"action_id": HOIST, "token": g_hoist["token"]},
+        ]
+    )
+
+    # The same seat re-applies for control of one card.
+    services.acquire(LIFT, "联排控制席")
+    state = services.get_action_state(LIFT)
+    assert state["event_count"] == 1
+    assert state["last_executed_by"] == "联排控制席"
+    assert state["last_link_id"] == out["link_id"]
+    assert state["status"] == "held"
+    assert state["holder"] == "联排控制席"
+
+    # Even a takeover by a different seat keeps the historical executor.
+    with db_pool.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE leases SET expires_at = now() WHERE action_id = %s",
+            (LIFT,),
+        )
+        conn.commit()
+    services.acquire(LIFT, "接管席")
+    state = services.get_action_state(LIFT)
+    assert state["holder"] == "接管席"
+    assert state["last_executed_by"] == "联排控制席"
+    assert state["event_count"] == 1
+    assert state["last_link_id"] == out["link_id"]
+
+
+def test_holder_with_surrounding_spaces_is_normalised(services):
+    """A seat name with surrounding spaces behaves like the trimmed name."""
+    grant = services.acquire(LIFT, "  联排控制席  ")
+    assert grant["holder"] == "联排控制席"
+    state = services.get_action_state(LIFT)
+    assert state["holder"] == "联排控制席"
+    # The raw token still authenticates the (normalised) lease.
+    out = services.execute(LIFT, grant["token"])
+    assert out["executed"] is True
+    assert out["executed_by"] == "联排控制席"
+
+
 # ------------------------------------------------------------- HTTP level
 
 
@@ -426,3 +556,78 @@ def test_http_linked_requires_two_distinct_actions(client):
     assert r.status_code == 400
     # The single-action endpoints are untouched by all of this.
     assert client.get(f"/api/actions/{LIFT}").json()["status"] == "held"
+
+
+def test_http_linked_rejects_same_device_pair_and_three_actions(client):
+    # Hold BOTH lift directions plus a hoist action.
+    up = client.post(
+        f"/api/actions/{LIFT}/lease", json={"holder": "联排控制席"}
+    ).json()["token"]
+    down = client.post(
+        f"/api/actions/{LIFT_DOWN}/lease", json={"holder": "联排控制席"}
+    ).json()["token"]
+    hoist = client.post(
+        f"/api/actions/{HOIST}/lease", json={"holder": "联排控制席"}
+    ).json()["token"]
+
+    # Two directions of one device are not a linked combination.
+    r = client.post(
+        "/api/actions/execute-linked",
+        json={
+            "items": [
+                {"action_id": LIFT, "token": up},
+                {"action_id": LIFT_DOWN, "token": down},
+            ]
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "invalid_request"
+
+    # Three held actions submitted together with all valid tokens: rejected
+    # as a whole — linked execution is exactly two cross-device actions.
+    r = client.post(
+        "/api/actions/execute-linked",
+        json={
+            "items": [
+                {"action_id": LIFT, "token": up},
+                {"action_id": LIFT_DOWN, "token": down},
+                {"action_id": HOIST, "token": hoist},
+            ]
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "invalid_request"
+
+    # Nothing executed: all three leases are still held and eventless.
+    for aid in (LIFT, LIFT_DOWN, HOIST):
+        state = client.get(f"/api/actions/{aid}").json()
+        assert state["status"] == "held"
+        assert state["event_count"] == 0
+
+
+def test_http_linked_last_executor_survives_reacquisition(client):
+    lift_token, hoist_token = _http_acquire_pair(client)
+    r = client.post(
+        "/api/actions/execute-linked",
+        json={
+            "items": [
+                {"action_id": LIFT, "token": lift_token},
+                {"action_id": HOIST, "token": hoist_token},
+            ]
+        },
+    )
+    assert r.status_code == 200, r.text
+    link_id = r.json()["link_id"]
+
+    # Re-acquire one card after the linked cue: history and last executor and
+    # the link id must all remain visible on the new live lease.
+    r = client.post(
+        f"/api/actions/{LIFT}/lease", json={"holder": "联排控制席"}
+    )
+    assert r.status_code == 200
+    state = client.get(f"/api/actions/{LIFT}").json()
+    assert state["status"] == "held"
+    assert state["holder"] == "联排控制席"
+    assert state["event_count"] == 1
+    assert state["last_executed_by"] == "联排控制席"
+    assert state["last_link_id"] == link_id

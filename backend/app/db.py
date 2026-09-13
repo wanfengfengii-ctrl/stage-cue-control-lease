@@ -106,7 +106,11 @@ _STATE_SELECT = """
            (SELECT e.link_id FROM action_events e
              WHERE e.action_id = a.id AND e.link_id IS NOT NULL
              ORDER BY e.id DESC LIMIT 1)
-               AS last_link_id
+               AS last_link_id,
+           (SELECT e.holder FROM action_events e
+             WHERE e.action_id = a.id
+             ORDER BY e.id DESC LIMIT 1)
+               AS last_executed_by
       FROM actions a
       LEFT JOIN LATERAL (
           SELECT * FROM leases
@@ -166,9 +170,10 @@ def state_from_row(row: dict[str, Any] | None, now) -> dict[str, Any]:
         "acquired_at": row["acquired_at"].isoformat() if is_held else None,
         "expires_at": row["expires_at"].isoformat() if is_held else None,
         "remaining_seconds": remaining,
-        "last_executed_by": row["holder"]
-        if row["executed_at"] is not None
-        else None,
+        # Derived from the most recent ACTION EVENT, not from the latest
+        # lease: after a linked run, re-acquiring (or even being taken over)
+        # must keep showing the seat that last executed the action.
+        "last_executed_by": row.get("last_executed_by"),
         "event_count": row["event_count"],
         # .get(): rows assembled outside _STATE_SELECT (tests) may lack it.
         "last_link_id": row.get("last_link_id"),

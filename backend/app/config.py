@@ -42,3 +42,18 @@ ACTION_LABELS = {
     "hoist_fly_out": "飞行吊点 退场",
     "emergency_stop": "紧急停止（联排）",
 }
+
+# Physical device each dangerous action belongs to. Linked execution is a
+# coordination BETWEEN devices: the lifting platform and the flying hoist move
+# together. Two directions of the SAME device (e.g. lift_up + lift_down) are
+# mutually exclusive and can never form a linked pair; emergency_stop is a
+# standalone interlock and never participates either.
+DEVICE_OF = {
+    "lift_up": "lift",
+    "lift_down": "lift",
+    "hoist_fly_in": "hoist",
+    "hoist_fly_out": "hoist",
+}
+
+# Only pairs spanning two different devices are valid linked combinations.
+LINKABLE_DEVICE_PAIRS = {frozenset(("lift", "hoist"))}
