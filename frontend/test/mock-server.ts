@@ -53,6 +53,9 @@ interface EventRec {
   action_id: string;
   session_id: number | null;
   event_id: number;
+  holder: string;
+  link_id: string | null;
+  occurred_at: number;
 }
 
 const ANOMALY_CATEGORIES = ["equipment", "operation", "environment", "other"];
@@ -73,6 +76,8 @@ export class MockServer {
   sessions: SessionRec[] = [];
   /** Every executed event with the session it was attributed to (if any). */
   eventLog: EventRec[] = [];
+  /** When > 0, the next history request(s) fail (decremented per request). */
+  failNextHistory = 0;
   private nextSessionId = 1;
   private nextEventId = 1;
   private nextAnomalyId = 1;
@@ -81,7 +86,7 @@ export class MockServer {
     return this.sessions.find((s) => s.endedAt === null);
   }
 
-  private recordEvent(actionId: string) {
+  private recordEvent(actionId: string, holder: string, linkId: string | null = null) {
     this.events[actionId] = (this.events[actionId] ?? 0) + 1;
     const event_id = this.nextEventId++;
     this.lastEventIds[actionId] = event_id;
@@ -89,6 +94,9 @@ export class MockServer {
       action_id: actionId,
       session_id: this.activeSession()?.id ?? null,
       event_id,
+      holder,
+      link_id: linkId,
+      occurred_at: this.serverNow,
     });
   }
 
@@ -251,7 +259,7 @@ export class MockServer {
     const events = items.map((it) => {
       const live = this.live(it.action_id)!;
       live.executed = true;
-      this.recordEvent(it.action_id);
+      this.recordEvent(it.action_id, live.holder, linkId);
       this.lastExecutedBy[it.action_id] = live.holder;
       this.links[it.action_id] = linkId;
       return {
@@ -390,6 +398,69 @@ export class MockServer {
     return { status: 200, body: { anomaly: { ...record }, state: this.state(id) } };
   }
 
+  /** Mirrors GET /api/history: keyset-paginated, newest first, read-only. */
+  private handleHistory(url: string) {
+    if (this.failNextHistory > 0) {
+      this.failNextHistory -= 1;
+      return {
+        status: 500,
+        body: { detail: { code: "http_error", message: "模拟的历史查询失败" } },
+      };
+    }
+    const u = new URL(url, "http://mock.local");
+    const cursorRaw = u.searchParams.get("cursor");
+    let cursor: number | null = null;
+    if (cursorRaw !== null) {
+      const v = cursorRaw.trim();
+      if (!/^\d+$/.test(v) || Number(v) <= 0) {
+        return {
+          status: 400,
+          body: {
+            detail: {
+              code: "history_cursor_invalid",
+              message: "历史游标无效：请使用上一页响应返回的下一页游标（事件编号）",
+            },
+          },
+        };
+      }
+      cursor = Number(v);
+    }
+    const limitRaw = Number(u.searchParams.get("limit") ?? "20");
+    const limit =
+      Number.isFinite(limitRaw) && limitRaw > 0
+        ? Math.min(Math.floor(limitRaw), 50)
+        : 20;
+    const sorted = [...this.eventLog].sort((a, b) => b.event_id - a.event_id);
+    const older =
+      cursor === null ? sorted : sorted.filter((e) => e.event_id < cursor!);
+    const page = older.slice(0, limit);
+    const hasMore = older.length > limit;
+    const events = page.map((e) => ({
+      event_id: e.event_id,
+      action_id: e.action_id,
+      label: LABELS[e.action_id],
+      holder: e.holder,
+      result: "executed",
+      link_id: e.link_id,
+      occurred_at: new Date(e.occurred_at).toISOString(),
+      session: e.session_id
+        ? {
+            id: e.session_id,
+            name:
+              this.sessions.find((s) => s.id === e.session_id)?.name ?? "",
+          }
+        : null,
+      anomaly: this.anomalies[e.event_id] ?? null,
+    }));
+    return {
+      status: 200,
+      body: {
+        events,
+        next_cursor: hasMore ? page[page.length - 1].event_id : null,
+      },
+    };
+  }
+
   /** Entry point used by the mocked global fetch. */
   handle(url: string, init?: { method?: string; body?: string }) {
     const method = init?.method ?? "GET";
@@ -397,6 +468,11 @@ export class MockServer {
 
     if (url.endsWith("/api/actions") && method === "GET") {
       return { status: 200, body: this.all() };
+    }
+
+    // Execution history carries a query string, so match the path prefix.
+    if (/\/api\/history(\?|$)/.test(url) && method === "GET") {
+      return this.handleHistory(url);
     }
 
     if (url.endsWith("/api/sessions/transition") && method === "POST") {
@@ -487,7 +563,7 @@ export class MockServer {
       }
       // execute: exactly one event
       live.executed = true;
-      this.recordEvent(id);
+      this.recordEvent(id, live.holder);
       this.lastExecutedBy[id] = live.holder;
       return {
         status: 200,

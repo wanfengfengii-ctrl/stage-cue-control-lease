@@ -3,6 +3,15 @@
 
 export type AnomalyCategory = "equipment" | "operation" | "environment" | "other";
 
+// Display labels for the stored anomaly category codes, shared by the card
+// panel and the execution-history view.
+export const ANOMALY_CATEGORY_LABELS: Record<AnomalyCategory, string> = {
+  equipment: "设备异常",
+  operation: "操作异常",
+  environment: "环境异常",
+  other: "其他异常",
+};
+
 export interface AnomalyRecord {
   id: number;
   event_id: number;
@@ -57,6 +66,29 @@ export interface SessionSummary {
   event_count: number;
   /** Distinct actions involved in this round. */
   action_count: number;
+}
+
+/** One row of the read-only execution history (执行历史). */
+export interface HistoryEvent {
+  /** Immutable event id; also the pagination cursor. */
+  event_id: number;
+  action_id: string;
+  label: string;
+  holder: string;
+  result: string;
+  /** Shared by the two events of one linked run; null for single executions. */
+  link_id: string | null;
+  occurred_at: string;
+  /** The rehearsal round this event counts towards, if any. */
+  session: { id: number; name: string } | null;
+  /** The anomaly reported on THIS event, with its confirmation result. */
+  anomaly: AnomalyRecord | null;
+}
+
+export interface HistoryPage {
+  events: HistoryEvent[];
+  /** Cursor for the next (older) page; null when no older events exist. */
+  next_cursor: number | null;
 }
 
 export interface LeaseGrant {
@@ -170,6 +202,16 @@ export const api = {
 
   currentSession: () =>
     request<{ session: SessionSummary | null }>("/api/sessions/current"),
+
+  // Read-only execution history, keyset-paginated by immutable event id:
+  // pass the previous page's next_cursor to fetch strictly older events.
+  listHistory: (cursor?: number | null, limit?: number) => {
+    const params = new URLSearchParams();
+    if (cursor != null) params.set("cursor", String(cursor));
+    if (limit != null) params.set("limit", String(limit));
+    const qs = params.toString();
+    return request<HistoryPage>(`/api/history${qs ? `?${qs}` : ""}`);
+  },
 
   reportAnomaly: (
     actionId: string,

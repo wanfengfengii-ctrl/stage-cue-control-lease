@@ -290,16 +290,17 @@ def state_from_row(row: dict[str, Any] | None, now) -> dict[str, Any]:
         # The card's anomaly UI follows THIS event: a new execution switches
         # last_event_id and the old anomaly no longer rides along.
         "last_event_id": row.get("last_event_id"),
-        "anomaly": _anomaly_from_state_row(row),
+        "anomaly": anomaly_from_prefixed_row(row),
         "server_time": now.isoformat(),
     }
 
 
-def _anomaly_from_state_row(row: dict[str, Any]) -> dict[str, Any] | None:
-    """Serialise the latest event's anomaly out of a _STATE_SELECT row.
+def anomaly_from_prefixed_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Serialise an anomaly out of a row with `anomaly_`-prefixed columns.
 
-    Columns carry the anomaly_ prefix there (LEFT JOIN LATERAL); absent
-    columns (e.g. hand-built rows in tests) simply yield None.
+    Shared by the action-state snapshot (_STATE_SELECT, LEFT JOIN LATERAL)
+    and the execution-history page (LEFT JOIN on event id).  Absent columns
+    (e.g. hand-built rows in tests) simply yield None.
     """
     if row.get("anomaly_id") is None:
         return None

@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ANOMALY_CATEGORY_LABELS,
   api,
   type ActionState,
   type ActionsSnapshot,
   type AnomalyCategory,
   type ApiError,
 } from "./api";
+import HistoryPanel from "./HistoryPanel";
 import { detectTakeover, formatClock, remainingSeconds } from "./lease";
 
 const TOKEN_KEY = "handover.tokens.v1";
@@ -35,13 +37,7 @@ function loadOrCreateConsoleId(): string {
 }
 
 // Anomaly categories offered on the card; the stored value is the code, the
-// snapshot/poll renders this Chinese label.
-export const ANOMALY_CATEGORY_LABELS: Record<AnomalyCategory, string> = {
-  equipment: "设备异常",
-  operation: "操作异常",
-  environment: "环境异常",
-  other: "其他异常",
-};
+// snapshot/poll renders the Chinese label from ANOMALY_CATEGORY_LABELS.
 const ANOMALY_CATEGORIES = Object.keys(
   ANOMALY_CATEGORY_LABELS,
 ) as AnomalyCategory[];
@@ -83,6 +79,9 @@ export default function App() {
   const [sessionName, setSessionName] = useState("");
   const [sessionBusy, setSessionBusy] = useState(false);
   const [sessionNotice, setSessionNotice] = useState<Notice | null>(null);
+  // The execution-history review panel opens on demand and always starts
+  // from the latest page (remount on every open).
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [tick, setTick] = useState(0);
   const fetchStartRef = useRef<number>(Date.now());
   const seatRef = useRef(seat);
@@ -394,6 +393,13 @@ export default function App() {
           maxLength={64}
         />
         <span className="hint">每个浏览器会话独立，令牌不会跨标签页共享。</span>
+        <button
+          type="button"
+          data-testid="btn-history-open"
+          onClick={() => setHistoryOpen(true)}
+        >
+          执行历史
+        </button>
       </section>
 
       {!seat.trim() ? (
@@ -489,6 +495,8 @@ export default function App() {
           </span>
         )}
       </footer>
+
+      {historyOpen && <HistoryPanel onClose={() => setHistoryOpen(false)} />}
     </main>
   );
 }

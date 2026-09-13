@@ -7,7 +7,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import anomalies, config, db, leases, sessions
+from . import anomalies, config, db, history, leases, sessions
 
 app = FastAPI(title="舞台联排控制权交接台", version="1.0.0")
 
@@ -115,6 +115,23 @@ def get_current_session():
     """The active session's summary, or the frozen summary of the last ended
     one — still queryable after the round is over."""
     return {"session": sessions.current_summary()}
+
+
+@app.get("/api/history")
+def get_history(cursor: str | None = None, limit: int | None = None):
+    """Read-only execution history for the post-show review, newest first.
+
+    `cursor` is the previous page's `next_cursor` (an immutable event id);
+    events executed while paging never shift older pages. An unparsable
+    cursor is a recognisable 400 history_cursor_invalid.
+    """
+    try:
+        return history.list_history(cursor, limit)
+    except leases.LeaseError as exc:
+        raise HTTPException(status_code=exc.status, detail={
+            "code": exc.code,
+            "message": exc.message,
+        })
 
 
 @app.get("/api/actions/{action_id}")

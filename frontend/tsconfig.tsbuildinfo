@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/api.ts","./src/lease.ts","./src/main.tsx","./src/vite-env.d.ts","./test/App.test.tsx","./test/lease.test.ts","./test/mock-server.ts","./test/setup.ts"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/HistoryPanel.tsx","./src/api.ts","./src/lease.ts","./src/main.tsx","./src/vite-env.d.ts","./test/App.test.tsx","./test/anomaly.test.tsx","./test/history.test.tsx","./test/lease.test.ts","./test/mock-server.ts","./test/session.test.tsx","./test/setup.ts"],"version":"5.9.3"}

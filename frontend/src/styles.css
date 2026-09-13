@@ -239,3 +239,96 @@ footer {
   font-size: 12px;
   text-align: right;
 }
+
+/* ---- execution history (执行历史) ---- */
+.history-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 10, 18, 0.72);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 40px 16px;
+  z-index: 30;
+}
+.history-panel {
+  width: min(760px, 100%);
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px 18px 18px;
+}
+.history-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px;
+  margin-bottom: 12px;
+}
+.history-head h2 { font-size: 18px; margin: 0; }
+.history-head .hint { flex: 1; }
+.history-status { color: var(--muted); font-size: 13px; }
+
+.history-list, .history-group-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.history-event {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #151d2e;
+}
+.history-event-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.history-event-id { font-weight: 700; color: var(--text); }
+.history-event-head strong { color: var(--text); }
+
+.history-group {
+  border: 1px solid var(--accent);
+  border-left-width: 4px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(59, 130, 246, 0.06);
+}
+.history-group-badge {
+  font-size: 12px;
+  color: #93c5fd;
+  margin-bottom: 6px;
+}
+.history-group .history-event { background: var(--panel); }
+
+.history-anomaly {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.history-anomaly.confirmed .anomaly-tag { color: var(--ok); border-color: var(--ok); }
+
+.history-tail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+.history-tail .notice { margin: 0; width: 100%; }

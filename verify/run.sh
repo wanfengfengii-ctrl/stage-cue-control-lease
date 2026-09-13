@@ -10,15 +10,15 @@ done
 curl -fsS http://web/health
 echo
 
-echo "==> [1/3] pytest: transaction contention + expiry boundary (real PostgreSQL)"
+echo "==> [1/3] pytest: transaction contention + expiry boundary + sessions/anomalies/history (real PostgreSQL)"
 cd /accept/backend
 /opt/venv/bin/python -m pytest -q
 
-echo "==> [2/3] Vitest: countdown boundary + takeover/old-token UI logic"
+echo "==> [2/3] Vitest: countdown boundary + takeover/old-token UI logic + session/anomaly/history components"
 cd /accept/frontend
 npm run test:unit
 
-echo "==> [3/3] Playwright: dual-browser handover (real FastAPI + PostgreSQL)"
+echo "==> [3/3] Playwright: dual-browser handover + linked/session/anomaly/history (real FastAPI + PostgreSQL)"
 npx playwright test
 
 echo

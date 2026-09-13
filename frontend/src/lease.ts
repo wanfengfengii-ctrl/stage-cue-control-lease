@@ -51,3 +51,12 @@ export function formatClock(iso: string | null): string {
   const d = new Date(iso);
   return d.toLocaleTimeString("zh-CN", { hour12: false });
 }
+
+/** Date + time for the execution history, where the day matters too. */
+export function formatDateTime(iso: string | null): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  const date = d.toLocaleDateString("zh-CN");
+  const time = d.toLocaleTimeString("zh-CN", { hour12: false });
+  return `${date} ${time}`;
+}
