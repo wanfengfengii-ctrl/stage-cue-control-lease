@@ -8,7 +8,12 @@ import {
   type ApiError,
 } from "./api";
 import HistoryPanel from "./HistoryPanel";
-import { detectTakeover, formatClock, remainingSeconds } from "./lease";
+import {
+  detectHandoverTransferred,
+  detectTakeover,
+  formatClock,
+  remainingSeconds,
+} from "./lease";
 
 const TOKEN_KEY = "handover.tokens.v1";
 const SEAT_KEY = "handover.seat.v1";
@@ -260,8 +265,14 @@ export default function App() {
   const mySeat = seat.trim();
 
   // Actions this seat currently controls (valid lease + token in session).
+  // A lease this console already handed over (accepted by another console)
+  // no longer counts, even if both consoles share the same seat name.
   const myHeld = actions.filter(
-    (s) => tokens[s.action_id] && s.holder === mySeat && s.status === "held",
+    (s) =>
+      tokens[s.action_id] &&
+      s.holder === mySeat &&
+      s.status === "held" &&
+      !detectHandoverTransferred(s, consoleId),
   );
   const labelOf = (actionId: string) =>
     actions.find((a) => a.action_id === actionId)?.label ?? actionId;
@@ -369,6 +380,8 @@ export default function App() {
           onExecute={() => onExecute(state.action_id)}
           onForget={() => onForget(state.action_id)}
           onAnomalyChanged={() => void refresh()}
+          onToken={(token) => setToken(state.action_id, token)}
+          onNotice={(n) => notice(state.action_id, n)}
           consoleId={consoleId}
         />
       )),
@@ -516,6 +529,8 @@ interface RowProps {
   onExecute: () => void;
   onForget: () => void;
   onAnomalyChanged: () => void;
+  onToken: (token: string) => void;
+  onNotice: (n: Notice) => void;
   consoleId: string;
 }
 
@@ -534,9 +549,17 @@ function ActionRow(props: RowProps) {
       ? remainingSeconds(state, nowMs, fetchStartMs, ttl)
       : 0;
 
-  const iHold = !!myToken && state.holder === mySeat && state.status === "held";
+  // A lease this console already handed over is dead even when the
+  // receiving console happens to use the same seat name: the accepted
+  // handover record's stable console ids decide, not the editable name.
+  const transferred = detectHandoverTransferred(state, props.consoleId);
+  const iHold =
+    !!myToken &&
+    state.holder === mySeat &&
+    state.status === "held" &&
+    !transferred;
   const lostButToken =
-    !!myToken && detectTakeover(state, mySeat, true);
+    !!myToken && (detectTakeover(state, mySeat, true) || transferred);
 
   return (
     <article
@@ -663,10 +686,29 @@ function ActionRow(props: RowProps) {
 
       {lostButToken && (
         <p className="notice error" data-testid="lost-banner">
-          控制权已失效：当前动作由「{state.holder ?? "—"}」持有或已空闲，
-          本页面保存的是旧令牌，任何操作都会被服务端拒绝。
+          {transferred
+            ? `控制权已交接：本席发起的换班交接已被「${
+                state.handover?.accepted_by ?? "接班席"
+              }」接收，本页面保存的旧令牌已失效。`
+            : `控制权已失效：当前动作由「${
+                state.holder ?? "—"
+              }」持有或已空闲，本页面保存的是旧令牌，任何操作都会被服务端拒绝。`}
         </p>
       )}
+      {/* Shift handover: the holder generates a one-time code here; the
+          receiving console redeems it on the same card. The polled record
+          drives every state (待接收 / 已接收 / 已失效). */}
+      <HandoverPanel
+        state={state}
+        iHold={iHold}
+        myToken={myToken}
+        mySeat={mySeat}
+        consoleId={props.consoleId}
+        busy={busy}
+        onToken={props.onToken}
+        onNotice={props.onNotice}
+        onChanged={props.onAnomalyChanged}
+      />
       {/* The anomaly record follows the card's most recent execution event;
           a key on that event id remounts the panel when a new event arrives,
           so an unsubmitted form or old state can never bleed across events. */}
@@ -685,6 +727,182 @@ function ActionRow(props: RowProps) {
         </p>
       )}
     </article>
+  );
+}
+
+interface HandoverPanelProps {
+  state: ActionState;
+  iHold: boolean;
+  myToken: string | null;
+  mySeat: string;
+  /** Stable identity of this browser console (independent of seat name). */
+  consoleId: string;
+  busy: boolean;
+  onToken: (token: string) => void;
+  onNotice: (n: Notice) => void;
+  onChanged: () => void;
+}
+
+/**
+ * Shift handover (换班交接) on the action card.
+ *
+ * The current holder generates a ONE-TIME code (returned by the server
+ * exactly once and kept here only in memory); until the receiving console
+ * redeems it, the holder keeps every right — renew, release, execute.
+ * The receiving console types the code into the same card; the server
+ * validates lease, record and validity window in one transaction and
+ * returns the fresh token ONLY to the receiver. Every rejection keeps the
+ * polled state and names the reason, prompting a fresh initiation.
+ */
+function HandoverPanel({
+  state,
+  iHold,
+  myToken,
+  mySeat,
+  consoleId,
+  busy,
+  onToken,
+  onNotice,
+  onChanged,
+}: HandoverPanelProps) {
+  const record = state.handover;
+  // The one-time code from MY initiate response: display-only, cleared as
+  // soon as the record leaves pending (accepted/invalidated/superseded).
+  const [myCode, setMyCode] = useState<string | null>(null);
+  const [acceptCode, setAcceptCode] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const pendingMine =
+    record?.status === "pending" && record.initiator_id === consoleId;
+  const pendingOthers =
+    record?.status === "pending" && record.initiator_id !== consoleId;
+
+  useEffect(() => {
+    if (!pendingMine) setMyCode(null);
+  }, [pendingMine]);
+
+  const startHandover = async () => {
+    if (!myToken) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const out = await api.initiateHandover(state.action_id, myToken, consoleId);
+      setMyCode(out.code);
+      onNotice({
+        kind: "success",
+        text: "一次性交接码已生成（仅本次显示）；对方接收前您仍可续期、释放或执行。",
+      });
+    } catch (e) {
+      // control_lost & co.: the polled snapshot keeps the latest state.
+      setError((e as ApiError).message);
+    } finally {
+      setSubmitting(false);
+      onChanged();
+    }
+  };
+
+  const acceptHandover = async () => {
+    const code = acceptCode.trim();
+    // Blank code: inline feedback, no request is sent.
+    if (!code) {
+      setError("请输入发起席出示的一次性交接码。");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      const out = await api.acceptHandover(state.action_id, code, mySeat, consoleId);
+      onToken(out.token);
+      setAcceptCode("");
+      onNotice({
+        kind: "success",
+        text: `已接收「${state.label}」控制权，新令牌仅本会话可见（${out.ttl_seconds} 秒有效）。`,
+      });
+    } catch (e) {
+      // handover_code_invalid / handover_invalid / handover_expired /
+      // handover_not_found / handover_self_accept: an identifiable reason;
+      // the page keeps the latest action state — re-initiate if needed.
+      setError((e as ApiError).message);
+    } finally {
+      setSubmitting(false);
+      onChanged();
+    }
+  };
+
+  return (
+    <div className="handover" data-testid="handover-panel">
+      {iHold && (
+        <div className="handover-initiate">
+          <button
+            type="button"
+            data-testid="btn-handover-initiate"
+            disabled={busy || submitting}
+            onClick={startHandover}
+          >
+            {pendingMine ? "重新生成交接码" : "发起换班交接"}
+          </button>
+          {pendingMine && myCode && (
+            <p className="handover-code" data-testid="handover-code">
+              一次性交接码：<strong>{myCode}</strong>
+              （仅本次显示，请交给接班席输入）
+            </p>
+          )}
+          {pendingMine && !myCode && (
+            <p className="hint" data-testid="handover-pending">
+              交接待接收：交接码仅在生成时显示，如已丢失可重新生成。
+            </p>
+          )}
+          {pendingMine && (
+            <p className="hint" data-testid="handover-rights">
+              对方接收前，您仍可续期、释放或执行。
+            </p>
+          )}
+        </div>
+      )}
+      {pendingOthers && !iHold && (
+        <div className="handover-accept" data-testid="handover-accept-form">
+          <span data-testid="handover-from">
+            「{record?.initiator}」发起了换班交接
+          </span>
+          <input
+            data-testid="handover-code-input"
+            value={acceptCode}
+            placeholder="输入一次性交接码"
+            maxLength={16}
+            onChange={(e) => {
+              setAcceptCode(e.target.value);
+              if (error) setError(null);
+            }}
+          />
+          <button
+            type="button"
+            className="primary"
+            data-testid="btn-handover-accept"
+            disabled={submitting}
+            onClick={acceptHandover}
+          >
+            确认接收
+          </button>
+        </div>
+      )}
+      {record?.status === "accepted" && record.initiator_id === consoleId && (
+        <p className="hint" data-testid="handover-done">
+          已交接给「{record.accepted_by}」（{formatClock(record.accepted_at)}{" "}
+          UTC）。
+        </p>
+      )}
+      {record?.status === "invalidated" && (
+        <p className="hint" data-testid="handover-invalid">
+          上一次换班交接已失效，可重新发起。
+        </p>
+      )}
+      {error && (
+        <p className="notice error" data-testid="handover-error">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
 

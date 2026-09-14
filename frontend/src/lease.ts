@@ -46,6 +46,25 @@ export function detectTakeover(
   );
 }
 
+/**
+ * Decide whether THIS console's lease was handed over (换班交接) to another
+ * console.  Seat names are freely editable and may coincide across two
+ * consoles, so the stable console ids on the accepted handover record are
+ * the only reliable signal: the initiator is me, the receiver is not.
+ */
+export function detectHandoverTransferred(
+  state: ActionState,
+  consoleId: string,
+): boolean {
+  const h = state.handover;
+  return (
+    !!h &&
+    h.status === "accepted" &&
+    h.initiator_id === consoleId &&
+    h.accepted_id !== consoleId
+  );
+}
+
 export function formatClock(iso: string | null): string {
   if (!iso) return "—";
   const d = new Date(iso);

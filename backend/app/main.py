@@ -7,7 +7,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import anomalies, config, db, history, leases, sessions
+from . import anomalies, config, db, handovers, history, leases, sessions
 
 app = FastAPI(title="舞台联排控制权交接台", version="1.0.0")
 
@@ -63,6 +63,21 @@ class AnomalyReportBody(BaseModel):
 class AnomalyConfirmBody(BaseModel):
     confirmer: str = Field(default="", description="确认席位名称")
     confirmer_id: str = Field(default="", description="确认控制台稳定身份标识")
+
+
+class HandoverInitiateBody(BaseModel):
+    # Defaults to "" so a missing token is judged uniformly by the service
+    # (401 missing_token) instead of a schema-level 422.
+    token: str = Field(default="", description="当前持有者的有效令牌")
+    # Stable identity of the initiating browser console (independent of the
+    # editable seat name), recorded on the handover.
+    initiator_id: str = Field(default="", description="发起控制台稳定身份标识")
+
+
+class HandoverAcceptBody(BaseModel):
+    code: str = Field(default="", description="发起席出示的一次性交接码")
+    recipient: str = Field(default="", description="接班席位名称（新租约持有者）")
+    recipient_id: str = Field(default="", description="接班控制台稳定身份标识")
 
 
 @app.on_event("startup")
@@ -244,6 +259,61 @@ def _anomaly_error(exc: anomalies.AnomalyError, action_id: str):
         if action_id in config.ACTION_IDS
         else None,
     })
+
+
+def _handover_error(exc, action_id: str):
+    """Handover rejections always carry the latest action state so the page
+    keeps rendering the real holder and can prompt a fresh initiation."""
+    if isinstance(exc, handovers.HandoverError):
+        detail = {
+            "code": exc.code,
+            "message": exc.message,
+            "handover": exc.handover,
+        }
+        status = exc.status
+    else:  # LeaseError raised while authenticating the initiator
+        detail = {"code": exc.code, "message": exc.message}
+        status = exc.status
+    detail["state"] = (
+        leases.get_action_state(action_id)
+        if action_id in config.ACTION_IDS
+        else None
+    )
+    raise HTTPException(status_code=status, detail=detail)
+
+
+@app.post("/api/actions/{action_id}/handover")
+def initiate_handover(action_id: str, body: HandoverInitiateBody,
+                      authorization: str | None = Header(default=None)):
+    """Open a shift handover: one-time code for the holder's LIVE lease.
+
+    Authenticated by the current lease token exactly like renew/release/
+    execute (body or Bearer); the lease itself is untouched, so the
+    original seat keeps every right until the code is redeemed. The raw
+    code is returned only in this response — the database stores its
+    SHA-256 hash.
+    """
+    token = _extract_token(body, authorization)
+    try:
+        return handovers.initiate(action_id, token, body.initiator_id)
+    except (handovers.HandoverError, leases.LeaseError) as exc:
+        _handover_error(exc, action_id)
+
+
+@app.post("/api/actions/{action_id}/handover/accept")
+def accept_handover(action_id: str, body: HandoverAcceptBody):
+    """Redeem the one-time code: old lease ends, new token issued here only.
+
+    One transaction locks the action and validates the initiating lease,
+    the handover status and the validity window; any failure is a
+    recognisable business error and never creates a lease.
+    """
+    try:
+        return handovers.accept(
+            action_id, body.code, body.recipient, body.recipient_id
+        )
+    except (handovers.HandoverError, leases.LeaseError) as exc:
+        _handover_error(exc, action_id)
 
 
 @app.post("/api/actions/{action_id}/anomaly")

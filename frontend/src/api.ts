@@ -28,6 +28,29 @@ export interface AnomalyRecord {
   confirmed_at: string | null;
 }
 
+/** One shift-handover record (换班交接) as carried by the action snapshot. */
+export interface HandoverRecord {
+  id: number;
+  /** The lease this handover transfers. */
+  lease_id: number;
+  initiator: string;
+  /** Stable identity of the initiating console (independent of seat name). */
+  initiator_id: string;
+  created_at: string;
+  /**
+   * 待接收 / 已接收 / 已失效. A pending record whose initiating lease was
+   * released, executed, expired or superseded is judged invalidated by the
+   * server at query time.
+   */
+  status: "pending" | "accepted" | "invalidated";
+  accepted_by: string | null;
+  /** Stable identity of the receiving console. */
+  accepted_id: string | null;
+  accepted_at: string | null;
+  /** Replacement lease issued to the receiver on acceptance. */
+  new_lease_id: number | null;
+}
+
 export interface ActionState {
   action_id: string;
   label: string;
@@ -44,6 +67,8 @@ export interface ActionState {
   last_event_id: number | null;
   /** Anomaly record of the most recent execution event, if reported. */
   anomaly: AnomalyRecord | null;
+  /** Latest shift-handover record with its effective (query-time) status. */
+  handover: HandoverRecord | null;
   server_time: string;
 }
 
@@ -112,6 +137,8 @@ export interface ApiError extends Error {
   session: SessionSummary | null;
   /** Anomaly report/confirm errors: the current record, if one exists. */
   anomaly: AnomalyRecord | null;
+  /** Handover initiate/accept errors: the current record, if one exists. */
+  handover: HandoverRecord | null;
 }
 
 function makeError(status: number, body: any): ApiError {
@@ -129,6 +156,7 @@ function makeError(status: number, body: any): ApiError {
   err.states = detail?.states ?? null;
   err.session = detail?.session ?? null;
   err.anomaly = detail?.anomaly ?? null;
+  err.handover = detail?.handover ?? null;
   return err;
 }
 
@@ -235,4 +263,36 @@ export const api = {
         body: JSON.stringify({ confirmer, confirmer_id: confirmerId }),
       },
     ),
+
+  // Shift handover: the holder opens a transfer and gets a ONE-TIME code
+  // (returned only here; the server stores its hash). The lease stays fully
+  // usable until the code is redeemed.
+  initiateHandover: (actionId: string, token: string, initiatorId: string) =>
+    request<{ code: string; handover: HandoverRecord; state: ActionState }>(
+      `/api/actions/${actionId}/handover`,
+      {
+        method: "POST",
+        body: JSON.stringify({ token, initiator_id: initiatorId }),
+      },
+    ),
+
+  // The receiving console redeems the code; the fresh token is returned
+  // ONLY in this response.
+  acceptHandover: (
+    actionId: string,
+    code: string,
+    recipient: string,
+    recipientId: string,
+  ) =>
+    request<{
+      token: string;
+      holder: string;
+      expires_at: string;
+      ttl_seconds: number;
+      handover: HandoverRecord;
+      state: ActionState;
+    }>(`/api/actions/${actionId}/handover/accept`, {
+      method: "POST",
+      body: JSON.stringify({ code, recipient, recipient_id: recipientId }),
+    }),
 };

@@ -120,6 +120,64 @@ CREATE TABLE IF NOT EXISTS action_anomalies (
 -- Migrations for databases created before console identities existed.
 ALTER TABLE action_anomalies ADD COLUMN IF NOT EXISTS reporter_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE action_anomalies ADD COLUMN IF NOT EXISTS confirmer_id TEXT;
+
+-- Shift handovers (换班交接): the current holder initiates a control transfer
+-- while the lease is still live; the system issues a ONE-TIME handover code
+-- (only its SHA-256 hash is stored) and the receiving console redeems it on
+-- the same action card.  A record only ever moves
+--
+--     pending（待接收）→ accepted（已接收）| invalidated（已失效）
+--
+-- 'invalidated' is also a READ-TIME judgement: a pending row whose
+-- initiating lease has been released, executed, expired or superseded is
+-- reported as invalidated by every query, and initiation cleans such stale
+-- rows up inside its own transaction, so a dead record never blocks a
+-- fresh handover or a normal lease application.
+CREATE TABLE IF NOT EXISTS lease_handovers (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    action_id     TEXT NOT NULL REFERENCES actions(id),
+    -- The lease this handover transfers; acceptance terminates it and
+    -- issues the replacement lease (new_lease_id) in one transaction.
+    lease_id      BIGINT NOT NULL REFERENCES leases(id),
+    -- SHA-256 of the one-time code; the raw code is returned to the
+    -- initiating console exactly once and never stored.
+    code_hash     TEXT NOT NULL,
+    initiator     TEXT NOT NULL,
+    -- Stable identity of the initiating browser console (independent of
+    -- the editable seat name), mirrored from the anomaly console ids.
+    initiator_id  TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    accepted_by   TEXT,
+    accepted_id   TEXT,
+    accepted_at   TIMESTAMPTZ,
+    new_lease_id  BIGINT REFERENCES leases(id),
+    -- The only legal shapes: pending (nothing stamped), accepted (receiving
+    -- seat, console and replacement lease all stamped) or invalidated
+    -- (nothing stamped, ever).
+    CONSTRAINT lease_handovers_status_check CHECK (
+        (status = 'pending' AND accepted_by IS NULL
+                            AND accepted_id IS NULL
+                            AND accepted_at IS NULL
+                            AND new_lease_id IS NULL)
+        OR
+        (status = 'accepted' AND accepted_by IS NOT NULL
+                             AND accepted_id IS NOT NULL
+                             AND accepted_at IS NOT NULL
+                             AND new_lease_id IS NOT NULL)
+        OR
+        (status = 'invalidated' AND accepted_by IS NULL
+                                AND accepted_id IS NULL
+                                AND accepted_at IS NULL
+                                AND new_lease_id IS NULL)
+    )
+);
+-- At most ONE pending handover per action at any instant, enforced at the
+-- SQL level: re-initiating first invalidates the previous pending row in
+-- the same transaction, so a lost code never wedges the action.
+CREATE UNIQUE INDEX IF NOT EXISTS lease_handovers_one_pending
+    ON lease_handovers (action_id)
+    WHERE status = 'pending';
 """
 
 
@@ -211,7 +269,20 @@ _STATE_SELECT = """
            an.reported_at AS anomaly_reported_at,
            an.status AS anomaly_status, an.confirmed_by AS anomaly_confirmed_by,
            an.confirmer_id AS anomaly_confirmer_id,
-           an.confirmed_at AS anomaly_confirmed_at
+           an.confirmed_at AS anomaly_confirmed_at,
+           -- The LATEST shift handover of this action (any status); its
+           -- effective status is derived in Python: a pending row whose
+           -- initiating lease is no longer the live one reads as
+           -- 'invalidated' (随查询判为失效).
+           h.id AS handover_id, h.lease_id AS handover_lease_id,
+           h.initiator AS handover_initiator,
+           h.initiator_id AS handover_initiator_id,
+           h.created_at AS handover_created_at,
+           h.status AS handover_status,
+           h.accepted_by AS handover_accepted_by,
+           h.accepted_id AS handover_accepted_id,
+           h.accepted_at AS handover_accepted_at,
+           h.new_lease_id AS handover_new_lease_id
       FROM actions a
       LEFT JOIN LATERAL (
           SELECT * FROM leases
@@ -227,6 +298,12 @@ _STATE_SELECT = """
                ORDER BY e.id DESC LIMIT 1
           )
       ) an ON TRUE
+      LEFT JOIN LATERAL (
+          SELECT hh.* FROM lease_handovers hh
+          WHERE hh.action_id = a.id
+          ORDER BY hh.id DESC
+          LIMIT 1
+      ) h ON TRUE
 """
 
 
@@ -291,7 +368,49 @@ def state_from_row(row: dict[str, Any] | None, now) -> dict[str, Any]:
         # last_event_id and the old anomaly no longer rides along.
         "last_event_id": row.get("last_event_id"),
         "anomaly": anomaly_from_prefixed_row(row),
+        # The latest shift handover with its effective (read-time) status.
+        "handover": handover_from_prefixed_row(
+            row, is_held, row.get("lease_id")
+        ),
         "server_time": now.isoformat(),
+    }
+
+
+def handover_from_prefixed_row(
+    row: dict[str, Any],
+    lease_live: bool,
+    latest_lease_id: int | None,
+) -> dict[str, Any] | None:
+    """Serialise a handover out of a row with `handover_`-prefixed columns.
+
+    `lease_live`/`latest_lease_id` describe the action's CURRENT latest
+    lease.  A pending record is only truly pending while its initiating
+    lease is still that live lease; the moment the lease is released,
+    executed, expired or superseded by a newer one, every query judges the
+    record invalidated (随查询判为失效) — no background sweeper needed and
+    normal applications are unaffected.  The raw code hash never leaves
+    the database.
+    """
+    if row.get("handover_id") is None:
+        return None
+    status = row["handover_status"]
+    if status == "pending" and not (
+        lease_live and row["handover_lease_id"] == latest_lease_id
+    ):
+        status = "invalidated"
+    return {
+        "id": row["handover_id"],
+        "lease_id": row["handover_lease_id"],
+        "initiator": row["handover_initiator"],
+        "initiator_id": row["handover_initiator_id"],
+        "created_at": row["handover_created_at"].isoformat(),
+        "status": status,
+        "accepted_by": row["handover_accepted_by"],
+        "accepted_id": row["handover_accepted_id"],
+        "accepted_at": row["handover_accepted_at"].isoformat()
+        if row["handover_accepted_at"]
+        else None,
+        "new_lease_id": row["handover_new_lease_id"],
     }
 
 

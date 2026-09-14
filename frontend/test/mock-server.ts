@@ -1,4 +1,9 @@
-import type { ActionState, AnomalyRecord, SessionSummary } from "../src/api";
+import type {
+  ActionState,
+  AnomalyRecord,
+  HandoverRecord,
+  SessionSummary,
+} from "../src/api";
 
 /**
  * In-memory test double that mirrors the FastAPI lease rules:
@@ -35,6 +40,10 @@ const DEVICE_OF: Record<string, string> = {
 };
 
 interface Lease {
+  /** Unique per granted lease; handover records reference it. Optional so
+   * tests can inject a takeover lease literally (never matches a handover's
+   * lease_id, which is exactly the "superseded" case). */
+  leaseId?: number;
   token: string;
   holder: string;
   expiresAt: number;
@@ -60,6 +69,25 @@ interface EventRec {
 
 const ANOMALY_CATEGORIES = ["equipment", "operation", "environment", "other"];
 
+/** Internal handover row: the mock keeps the raw code (the real service
+ * stores only its hash) so accept can compare it; the code is never
+ * exposed through the snapshot. */
+interface MockHandover {
+  id: number;
+  lease_id: number;
+  code: string;
+  initiator: string;
+  initiator_id: string;
+  created_at: string;
+  status: "pending" | "accepted" | "invalidated";
+  accepted_by: string | null;
+  accepted_id: string | null;
+  accepted_at: string | null;
+  new_lease_id: number | null;
+}
+
+const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
 export class MockServer {
   leases: Record<string, Lease> = {};
   serverNow = 1_700_000_000_000;
@@ -73,6 +101,8 @@ export class MockServer {
   lastEventIds: Record<string, number> = {};
   /** event_id -> its anomaly record (at most one per event). */
   anomalies: Record<number, AnomalyRecord> = {};
+  /** action_id -> handover records in creation order. */
+  handovers: Record<string, MockHandover[]> = {};
   sessions: SessionRec[] = [];
   /** Every executed event with the session it was attributed to (if any). */
   eventLog: EventRec[] = [];
@@ -81,6 +111,8 @@ export class MockServer {
   private nextSessionId = 1;
   private nextEventId = 1;
   private nextAnomalyId = 1;
+  private nextLeaseId = 1;
+  private nextHandoverId = 1;
 
   private activeSession(): SessionRec | undefined {
     return this.sessions.find((s) => s.endedAt === null);
@@ -138,6 +170,35 @@ export class MockServer {
     return eventId ? this.anomalies[eventId] ?? null : null;
   }
 
+  /** The latest handover with its effective (query-time) status. */
+  private handoverFor(id: string): HandoverRecord | null {
+    const list = this.handovers[id];
+    if (!list || list.length === 0) return null;
+    return this.publicHandover(id, list[list.length - 1]);
+  }
+
+  /** Serialise a record, deriving 'invalidated' exactly like the service:
+   * a pending record whose initiating lease is no longer the live one. */
+  private publicHandover(id: string, h: MockHandover): HandoverRecord {
+    let status = h.status;
+    if (status === "pending") {
+      const live = this.live(id);
+      if (!live || live.leaseId !== h.lease_id) status = "invalidated";
+    }
+    return {
+      id: h.id,
+      lease_id: h.lease_id,
+      initiator: h.initiator,
+      initiator_id: h.initiator_id,
+      created_at: h.created_at,
+      status,
+      accepted_by: h.accepted_by,
+      accepted_id: h.accepted_id,
+      accepted_at: h.accepted_at,
+      new_lease_id: h.new_lease_id,
+    };
+  }
+
   private state(id: string): ActionState {
     const l = this.live(id);
     return {
@@ -155,6 +216,7 @@ export class MockServer {
       last_link_id: this.links[id] ?? null,
       last_event_id: this.lastEventIds[id] ?? null,
       anomaly: this.anomalyFor(id),
+      handover: this.handoverFor(id),
       server_time: new Date(this.serverNow).toISOString(),
     };
   }
@@ -472,6 +534,194 @@ export class MockServer {
     };
   }
 
+  /** Mirrors POST /api/actions/{id}/handover: one-time code, lease untouched. */
+  private handleHandoverInitiate(id: string, payload: any) {
+    if (!ACTION_IDS.includes(id)) {
+      return this.err("unknown_action", "未知动作", id);
+    }
+    const token: string = payload.token ?? "";
+    if (!token) return this.err("missing_token", "缺少令牌", id);
+    const live = this.live(id);
+    if (!live || live.token !== token) {
+      return this.err(
+        "control_lost",
+        live
+          ? "控制权已失效：该令牌已被新租约取代"
+          : "控制权已失效：租约已到期、释放或执行",
+        id,
+      );
+    }
+    const initiatorId = (payload.initiator_id ?? "").trim();
+    if (!initiatorId) {
+      return {
+        status: 400,
+        body: {
+          detail: {
+            code: "invalid_handover",
+            message: "缺少发起席控制台身份标识",
+            state: this.state(id),
+          },
+        },
+      };
+    }
+    // A fresh code replaces every previous pending record.
+    for (const h of this.handovers[id] ?? []) {
+      if (h.status === "pending") h.status = "invalidated";
+    }
+    const code = Array.from(
+      { length: 8 },
+      () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)],
+    ).join("");
+    const record: MockHandover = {
+      id: this.nextHandoverId++,
+      lease_id: live.leaseId ?? 0,
+      code,
+      initiator: live.holder,
+      initiator_id: initiatorId,
+      created_at: new Date(this.serverNow).toISOString(),
+      status: "pending",
+      accepted_by: null,
+      accepted_id: null,
+      accepted_at: null,
+      new_lease_id: null,
+    };
+    (this.handovers[id] ??= []).push(record);
+    return {
+      status: 200,
+      body: {
+        code,
+        handover: this.publicHandover(id, record),
+        state: this.state(id),
+      },
+    };
+  }
+
+  /** Mirrors POST /api/actions/{id}/handover/accept: all-or-nothing transfer. */
+  private handleHandoverAccept(id: string, payload: any) {
+    if (!ACTION_IDS.includes(id)) {
+      return this.err("unknown_action", "未知动作", id);
+    }
+    const err = (
+      status: number,
+      code: string,
+      message: string,
+      handover?: HandoverRecord | null,
+    ) => ({
+      status,
+      body: {
+        detail: {
+          code,
+          message,
+          handover: handover ?? null,
+          state: this.state(id),
+        },
+      },
+    });
+    const recipient = (payload.recipient ?? "").trim();
+    const recipientId = (payload.recipient_id ?? "").trim();
+    if (!recipient || !recipientId) {
+      return err(400, "invalid_handover", "接班席位名称与控制台标识不能为空");
+    }
+    const pending = [...(this.handovers[id] ?? [])]
+      .reverse()
+      .find((h) => h.status === "pending");
+    if (!pending) {
+      return err(
+        409,
+        "handover_not_found",
+        "当前没有待接收的交接：请确认发起席已生成交接码",
+      );
+    }
+    const live = this.live(id);
+    if (!live || live.leaseId !== pending.lease_id) {
+      const invalidated = this.publicHandover(id, {
+        ...pending,
+        status: "invalidated",
+      });
+      const current = this.leases[id];
+      const dead =
+        current && current.leaseId === pending.lease_id ? current : null;
+      if (!dead) {
+        return err(
+          409,
+          "handover_invalid",
+          "交接已失效：发起租约已被新租约取代，请重新发起交接",
+          invalidated,
+        );
+      }
+      if (dead.released) {
+        return err(
+          409,
+          "handover_invalid",
+          "交接已失效：发起席已释放控制权，请重新发起交接",
+          invalidated,
+        );
+      }
+      if (dead.executed) {
+        return err(
+          409,
+          "handover_invalid",
+          "交接已失效：发起席已执行该动作，请重新发起交接",
+          invalidated,
+        );
+      }
+      return err(
+        409,
+        "handover_expired",
+        "交接已失效：接收时租约刚好到期，请重新申请控制权",
+        invalidated,
+      );
+    }
+    const code = (payload.code ?? "")
+      .toUpperCase()
+      .replace(/[-\s]/g, "")
+      .trim();
+    if (code !== pending.code) {
+      return err(
+        409,
+        "handover_code_invalid",
+        "交接码错误，请核对后重试",
+        this.publicHandover(id, pending),
+      );
+    }
+    if (pending.initiator_id === recipientId) {
+      return err(
+        409,
+        "handover_self_accept",
+        "发起席不能接收自己的交接码，请由接班席（另一控制台）接收",
+        this.publicHandover(id, pending),
+      );
+    }
+    // All checks passed: terminate the old lease, issue the replacement.
+    live.released = true;
+    const token = `tok-${Math.random().toString(36).slice(2)}-${id}`;
+    const newLease: Lease = {
+      leaseId: this.nextLeaseId++,
+      token,
+      holder: recipient,
+      expiresAt: this.serverNow + this.ttl,
+      released: false,
+      executed: false,
+    };
+    this.leases[id] = newLease;
+    pending.status = "accepted";
+    pending.accepted_by = recipient;
+    pending.accepted_id = recipientId;
+    pending.accepted_at = new Date(this.serverNow).toISOString();
+    pending.new_lease_id = newLease.leaseId ?? null;
+    return {
+      status: 200,
+      body: {
+        token,
+        holder: recipient,
+        expires_at: new Date(newLease.expiresAt).toISOString(),
+        ttl_seconds: 30,
+        handover: this.publicHandover(id, pending),
+        state: this.state(id),
+      },
+    };
+  }
+
   /** Entry point used by the mocked global fetch. */
   handle(url: string, init?: { method?: string; body?: string }) {
     const method = init?.method ?? "GET";
@@ -509,6 +759,16 @@ export class MockServer {
       return this.handleAnomalyReport(m[1], payload);
     }
 
+    // Shift handover routes (also two-segment, before the generic regex).
+    m = url.match(/\/api\/actions\/([^/]+)\/handover\/accept$/);
+    if (m && method === "POST") {
+      return this.handleHandoverAccept(m[1], payload);
+    }
+    m = url.match(/\/api\/actions\/([^/]+)\/handover$/);
+    if (m && method === "POST") {
+      return this.handleHandoverInitiate(m[1], payload);
+    }
+
     m = url.match(/\/api\/actions\/([^/]+)(?:\/(lease|renew|release|execute))?$/);
     if (!m) return { status: 404, body: { detail: "not found" } };
     const id = m[1];
@@ -524,6 +784,7 @@ export class MockServer {
       const token = `tok-${Math.random().toString(36).slice(2)}-${id}`;
       const holder = (payload.holder ?? "").trim();
       const lease: Lease = {
+        leaseId: this.nextLeaseId++,
         token,
         holder,
         expiresAt: this.serverNow + this.ttl,
